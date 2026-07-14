@@ -36,13 +36,16 @@ public class MLMod {
     private BufferedReader in;
     private boolean isConnecting = false;
 
-    // 1. Create the Keybinding and State Tracker
-    private KeyBinding recordKey;
+    // 1. Create the Keybindings and State Trackers
+    private KeyBinding aiToggleKey;     // P - AI takes over the controls
+    private KeyBinding recordToggleKey; // O - stream "recording=true" so the logger saves frames
     private boolean isAiActive = false;
+    private boolean isRecording = false;
+    private long tickCounter = 0; // lets Python detect session gaps when stacking frames
 
-    // --- NEW: AI Aim Sensitivity Multiplier ---
-    // Boosts the AI's smoothed mouse movements to combat MSE regression lag
-    private float aiAimSensitivity = 2.5f;
+    // Model now predicts true per-tick deltas (label off-by-one fixed in training),
+    // so no artificial boost is needed
+    private float aiAimSensitivity = 1.0f;
 
     // The "Mailbox" - Volatile ensures thread safety when reading/writing
     private volatile BotAction currentAction = new BotAction();
@@ -58,9 +61,11 @@ public class MLMod {
     public void init(FMLInitializationEvent event) {
         MinecraftForge.EVENT_BUS.register(this);
 
-        // Register the 'P' key in the Minecraft Controls menu
-        recordKey = new KeyBinding("Toggle AI", Keyboard.KEY_P, "ML PvP Bot");
-        ClientRegistry.registerKeyBinding(recordKey);
+        // Register the keys in the Minecraft Controls menu
+        aiToggleKey = new KeyBinding("Toggle AI", Keyboard.KEY_P, "ML PvP Bot");
+        ClientRegistry.registerKeyBinding(aiToggleKey);
+        recordToggleKey = new KeyBinding("Toggle Recording", Keyboard.KEY_O, "ML PvP Bot");
+        ClientRegistry.registerKeyBinding(recordToggleKey);
 
         attemptBackgroundConnection();
     }
@@ -113,7 +118,13 @@ public class MLMod {
         if (event.phase != TickEvent.Phase.START || mc.thePlayer == null || mc.theWorld == null) return;
 
         // 2. The Toggle Logic
-        if (recordKey.isPressed()) {
+        if (recordToggleKey.isPressed()) {
+            isRecording = !isRecording;
+            String recMsg = isRecording ? "\u00A7e[ML Bot] RECORDING" : "\u00A77[ML Bot] RECORDING STOPPED";
+            mc.thePlayer.addChatMessage(new ChatComponentText(recMsg));
+        }
+
+        if (aiToggleKey.isPressed()) {
             isAiActive = !isAiActive;
             String statusMsg = isAiActive ? "\u00A7a[ML Bot] AI ACTIVATED" : "\u00A7c[ML Bot] AI DEACTIVATED";
             mc.thePlayer.addChatMessage(new ChatComponentText(statusMsg));
@@ -149,6 +160,10 @@ public class MLMod {
         try {
             JsonObject json = new JsonObject();
 
+            // Session bookkeeping - lets Python detect gaps when stacking frames
+            json.addProperty("tick", tickCounter++);
+            json.addProperty("recording", isRecording);
+
             // Game State
             json.addProperty("player_x", mc.thePlayer.posX);
             json.addProperty("player_y", mc.thePlayer.posY);
@@ -156,15 +171,32 @@ public class MLMod {
             json.addProperty("player_yaw", mc.thePlayer.rotationYaw);
             json.addProperty("player_pitch", mc.thePlayer.rotationPitch);
             json.addProperty("on_ground", mc.thePlayer.onGround);
+            json.addProperty("my_vx", mc.thePlayer.posX - mc.thePlayer.prevPosX);
+            json.addProperty("my_vz", mc.thePlayer.posZ - mc.thePlayer.prevPosZ);
+            json.addProperty("my_hurt", mc.thePlayer.hurtTime);
 
             if (target != null) {
                 json.addProperty("target_x", target.posX);
                 json.addProperty("target_y", target.posY);
                 json.addProperty("target_z", target.posZ);
                 json.addProperty("target_dist", closestDist);
+                json.addProperty("tgt_vx", target.posX - target.prevPosX);
+                json.addProperty("tgt_vz", target.posZ - target.prevPosZ);
+                json.addProperty("tgt_hurt", target.hurtTime);
             } else {
                 json.addProperty("target_dist", -1.0);
             }
+
+            // Human inputs - what the logger records as training labels
+            json.addProperty("in_w", mc.gameSettings.keyBindForward.isKeyDown());
+            json.addProperty("in_a", mc.gameSettings.keyBindLeft.isKeyDown());
+            json.addProperty("in_s", mc.gameSettings.keyBindBack.isKeyDown());
+            json.addProperty("in_d", mc.gameSettings.keyBindRight.isKeyDown());
+            // actual sprint state, not the keybind - double-tap-W sprinting never
+            // presses keyBindSprint, so reading the key logs sprint as always-off
+            json.addProperty("in_sprint", mc.thePlayer.isSprinting());
+            json.addProperty("in_left_click", mc.gameSettings.keyBindAttack.isKeyDown());
+            json.addProperty("in_right_click", mc.gameSettings.keyBindUseItem.isKeyDown());
 
             out.println(json.toString());
         } catch (Exception e) {
@@ -181,9 +213,10 @@ public class MLMod {
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.getKeyCode(), action.d);
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.getKeyCode(), action.sprint);
 
-            // Apply the sensitivity multiplier to counteract PyTorch MSE smoothing
             mc.thePlayer.rotationYaw += (action.yaw_delta * aiAimSensitivity);
             mc.thePlayer.rotationPitch += (action.pitch_delta * aiAimSensitivity);
+            // Vanilla mouse input can never push pitch past vertical; neither may the AI
+            mc.thePlayer.rotationPitch = Math.max(-90f, Math.min(90f, mc.thePlayer.rotationPitch));
 
             if (action.left_click) {
                 KeyBinding.onTick(mc.gameSettings.keyBindAttack.getKeyCode());
