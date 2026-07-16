@@ -1,103 +1,146 @@
+import sys
 import socket
 import json
 from collections import deque
 
+import numpy as np
 import torch
 
-# Single source of truth: architecture from train_model, features from features
+# Single source of truth: architecture from train_model, features from features,
+# combat rules from combat.
 from train_model import PvPCloner
 from features import frame_features, STACK, FRAME_DIM
+from combat import CombatController, idle_action
+from pvp_env import ACTIONS
 
-# Per-key decision thresholds, calibrated on held-out data so the bot presses each
-# key at the same rate the human did. A flat 0.5 doesn't work: positive-class
-# weighting during training inflates the rare keys, which had the bot left-clicking
-# 79% of ticks when the human clicked 35%.
-#             W      A      S      D    Sprint L_Click R_Click
-THRESHOLDS = [0.559, 0.360, 0.202, 0.398, 0.698, 0.543, 0.637]
+#                 W      A      S      D    Sprint
+MOVE_THRESHOLDS = [0.559, 0.360, 0.202, 0.398, 0.698]
 
-def start_ai_server(host='127.0.0.1', port=9999):
-    # 1. Load the trained brain
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    model = PvPCloner().to(device)
-    model.load_state_dict(torch.load('pvp_model_v2.pth', map_location=device))
-    model.eval() # Evaluation mode (disables training features, speeds up execution)
-    print("AI Brain Loaded Successfully!")
+# Movement to close the gap when the target is past MAX_RANGE (no training data there).
+CHASE = {"w": True, "a": False, "s": False, "d": False, "sprint": True}
 
+
+def _accept(host, port):
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((host, port))
     server_socket.listen(1)
-
     print("Waiting for Minecraft connection...")
-    conn, addr = server_socket.accept()
+    conn, _ = server_socket.accept()
+    server_socket.close()
     print("Connected! Press 'P' in-game to unleash the AI.")
+    return conn
 
+
+def _obs_vec(history):
+    return np.array([v for f in history for v in f], dtype=np.float32)
+
+
+def start_bc_bot(host='127.0.0.1', port=9999):
+    """Behavioral-cloning bot: learned MOVEMENT + fully computed aim/attack (combat.act)."""
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model = PvPCloner().to(device)
+    model.load_state_dict(torch.load('pvp_model_v2.pth', map_location=device))
+    model.eval()
+    print("BC brain loaded (learned movement + computed aim/attack).")
+
+    conn = _accept(host, port)
     buffer = ""
-    # Rolling window of the last STACK ticks, zero-padded until it fills
     history = deque([[0.0] * FRAME_DIM] * STACK, maxlen=STACK)
-    ticks_since_click = 99  # rate-limits attacks to ~10 CPS instead of 20
+    combat = CombatController()
 
     try:
-        with torch.no_grad(): # Don't calculate gradients during live gameplay
+        with torch.no_grad():
             while True:
                 data = conn.recv(4096).decode('utf-8')
-                if not data: break
-
+                if not data:
+                    break
                 buffer += data
                 while "\n" in buffer:
                     packet, buffer = buffer.split("\n", 1)
                     if not packet.strip():
                         continue
                     obs = json.loads(packet)
-
-                    action = {
-                        "w": False, "a": False, "s": False, "d": False,
-                        "sprint": False, "left_click": False, "right_click": False,
-                        "yaw_delta": 0.0, "pitch_delta": 0.0
-                    }
-
-                    # 2. Build this tick's feature frame and push it into history
                     frame = frame_features(obs)
                     history.append(frame)
 
-                    # has_target flag: only act when someone is within MAX_RANGE
-                    if frame[0] == 1.0:
-                        x_tensor = torch.tensor(
-                            [[v for f in history for v in f]],
-                            dtype=torch.float32
-                        ).to(device)
+                    dist = obs.get("target_dist", -1.0)
+                    if dist is None or dist <= 0.0:
+                        conn.sendall((json.dumps(idle_action()) + "\n").encode('utf-8'))
+                        continue
 
-                        aim_preds, key_logits = model(x_tensor)
+                    if frame[0] == 1.0:  # in range -> learned movement
+                        x = torch.tensor([_obs_vec(history)], dtype=torch.float32).to(device)
+                        key_probs = torch.sigmoid(model(x)[1][0]).cpu().numpy()
+                        movement = {k: bool(key_probs[i] > MOVE_THRESHOLDS[i])
+                                    for i, k in enumerate(["w", "a", "s", "d", "sprint"])}
+                    else:                # past MAX_RANGE -> close the gap
+                        movement = CHASE
 
-                        # 3. Decode the AI's output
-                        aim_deltas = aim_preds[0].cpu().numpy()
-                        # Sigmoid converts raw logits into probabilities (0.0 to 1.0)
-                        key_probs = torch.sigmoid(key_logits[0]).cpu().numpy()
-
-                        # Safety clamp: never turn faster than a human flick in one tick
-                        action["yaw_delta"] = max(-45.0, min(45.0, float(aim_deltas[0])))
-                        action["pitch_delta"] = max(-30.0, min(30.0, float(aim_deltas[1])))
-                        action["w"] = bool(key_probs[0] > THRESHOLDS[0])
-                        action["a"] = bool(key_probs[1] > THRESHOLDS[1])
-                        action["s"] = bool(key_probs[2] > THRESHOLDS[2])
-                        action["d"] = bool(key_probs[3] > THRESHOLDS[3])
-                        action["sprint"] = bool(key_probs[4] > THRESHOLDS[4])
-
-                        # Attack fires a full click every tick it's true, so
-                        # cap it at every other tick (~10 CPS)
-                        ticks_since_click += 1
-                        if key_probs[5] > THRESHOLDS[5] and ticks_since_click >= 2:
-                            action["left_click"] = True
-                            ticks_since_click = 0
-                        action["right_click"] = bool(key_probs[6] > THRESHOLDS[6])
-
-                    # Send the AI's decision back to Java
+                    action = combat.act(obs, movement)
                     conn.sendall((json.dumps(action) + "\n").encode('utf-8'))
-
     except KeyboardInterrupt:
         print("\nShutting down AI Server.")
     finally:
         conn.close()
 
+
+def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'):
+    """Self-play policy: learned movement AND learned attack/block/W-tap + aim residual
+    (combat.act_policy). This is the trained result of train_selfplay.py."""
+    # Imported here so the BC path doesn't depend on the RL module.
+    from train_selfplay import ActorCritic, DEVICE
+
+    model = ActorCritic().to(DEVICE)
+    model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+    model.eval()
+    print(f"Self-play brain loaded from {ckpt} (learned movement + attack/block/aim).")
+
+    conn = _accept(host, port)
+    buffer = ""
+    history = deque([[0.0] * FRAME_DIM] * STACK, maxlen=STACK)
+    combat = CombatController()
+
+    try:
+        while True:
+            data = conn.recv(4096).decode('utf-8')
+            if not data:
+                break
+            buffer += data
+            while "\n" in buffer:
+                packet, buffer = buffer.split("\n", 1)
+                if not packet.strip():
+                    continue
+                obs = json.loads(packet)
+                frame = frame_features(obs)
+                history.append(frame)
+
+                dist = obs.get("target_dist", -1.0)
+                if dist is None or dist <= 0.0:
+                    conn.sendall((json.dumps(idle_action()) + "\n").encode('utf-8'))
+                    continue
+
+                if frame[0] == 1.0:  # in range -> the policy owns everything
+                    act, _, _ = model.act(_obs_vec(history), greedy=True)
+                    w, a, s, d, sprint = ACTIONS[act["move"]]
+                    movement = {"w": w, "a": a, "s": s, "d": d, "sprint": sprint}
+                    click, block, aim = act["click"], act["block"], act["aim"]
+                else:                # past MAX_RANGE -> chase, still aim, don't swing
+                    movement, click, block, aim = CHASE, 0, 0, (0.0, 0.0)
+
+                action = combat.act_policy(obs, movement, bool(click), bool(block), aim)
+                conn.sendall((json.dumps(action) + "\n").encode('utf-8'))
+    except KeyboardInterrupt:
+        print("\nShutting down AI Server.")
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
-    start_ai_server()
+    # `python ai_server.py`            -> behavioral-cloning bot (default)
+    # `python ai_server.py selfplay`   -> trained self-play policy (pvp_selfplay_best.pth)
+    if len(sys.argv) > 1 and sys.argv[1] == "selfplay":
+        ckpt = sys.argv[2] if len(sys.argv) > 2 else "pvp_selfplay_best.pth"
+        start_selfplay_bot(ckpt=ckpt)
+    else:
+        start_bc_bot()

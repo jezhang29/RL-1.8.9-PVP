@@ -3,6 +3,7 @@ package net.soupchugger.ml;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGameOver;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.entity.player.EntityPlayer;
 import net.minecraft.util.ChatComponentText;
@@ -36,6 +37,11 @@ public class MLMod {
     private BufferedReader in;
     private boolean isConnecting = false;
 
+    // Python backend port. Both self-play clients run this same jar, so the SECOND
+    // client must override this to 9998 with a JVM arg: -Dmlpvp.port=9998 (the learner
+    // stays on the default 9999). Single-client use (BC bot / recording) needs nothing.
+    private final int aiPort = Integer.getInteger("mlpvp.port", 9999);
+
     // 1. Create the Keybindings and State Trackers
     private KeyBinding aiToggleKey;     // P - AI takes over the controls
     private KeyBinding recordToggleKey; // O - stream "recording=true" so the logger saves frames
@@ -47,14 +53,44 @@ public class MLMod {
     // so no artificial boost is needed
     private float aiAimSensitivity = 1.0f;
 
+    // Camera smoothing. We apply the whole per-tick rotation at tick START (physics
+    // reads the final angle, so hit registration is unchanged). But the entity's
+    // onUpdate() copies prevRotation = rotation during the tick, which zeroes the
+    // camera's frame-to-frame interpolation and makes AI aim look 20 fps / steppy. At
+    // tick END we restore prevRotation to the PRE-delta angle so the vanilla camera
+    // sweeps prev->current smoothly across every render frame at the real framerate.
+    private float preYaw, prePitch;
+    private boolean rotationSmoothPending = false;
+
     // The "Mailbox" - Volatile ensures thread safety when reading/writing
     private volatile BotAction currentAction = new BotAction();
+    // A chat command the AI wants run (e.g. "/tp" to reset a self-play round).
+    // Must be executed on the client thread, so onClientTick drains it.
+    private volatile String pendingCommand = null;
+
+    // Control-loop staleness. Python echoes back (ack_tick) the tick of the state
+    // each action was computed from. Healthy pipelining is staleness 1 at apply time:
+    // this tick we apply the reply to LAST tick's state. When the two clients' tick
+    // clocks sit nearly a full cycle apart, Python (which replies only after hearing
+    // from BOTH fighters) answers one client just AFTER its next tick starts - that
+    // client then applies every action a tick late (staleness 2). Double control
+    // latency at the same AIM_GAIN is what reads as the crosshair orbiting/"spinning",
+    // and because both tick clocks are periodic the bad phase persists all session
+    // (any pause, e.g. opening a GUI, re-rolls it - which is why toggling video
+    // settings "fixed" it). Fix: when the reply to last tick's state hasn't arrived
+    // yet, wait up to FRESH_WAIT_MS for it instead of applying the stale action.
+    // Costs 0 in a good phase, a few ms/tick in a bad one. Skipped when Python is
+    // genuinely paused (lag > 4 ticks, e.g. a PPO update) or never acks (BC server).
+    private static final int FRESH_WAIT_MS = 25;
+    private long lastStaleness = -1;                       // reported in telemetry
+    private long staleSum = 0, staleMax = 0, staleTicks = 0, staleWaitedMs = 0;
 
     // Data container for our inputs
     public static class BotAction {
-        public boolean w, a, s, d, sprint;
+        public boolean w, a, s, d, sprint, jump;
         public float yaw_delta, pitch_delta;
         public boolean left_click, right_click;
+        public long ack_tick = -1;   // tick of the state this action responds to
     }
 
     @Mod.EventHandler
@@ -76,10 +112,10 @@ public class MLMod {
 
         new Thread(() -> {
             try {
-                Socket socket = new Socket("127.0.0.1", 9999);
+                Socket socket = new Socket("127.0.0.1", aiPort);
                 out = new PrintWriter(socket.getOutputStream(), true);
                 in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-                System.out.println("[Telemetry] Connected to Python AI Server!");
+                System.out.println("[Telemetry] Connected to Python AI Server on port " + aiPort + "!");
 
                 // Start a nested infinite loop just for reading commands from the AI
                 String line;
@@ -96,8 +132,16 @@ public class MLMod {
                     newAction.yaw_delta = json.has("yaw_delta") ? json.get("yaw_delta").getAsFloat() : 0f;
                     newAction.pitch_delta = json.has("pitch_delta") ? json.get("pitch_delta").getAsFloat() : 0f;
 
+                    newAction.ack_tick = json.has("ack_tick") ? json.get("ack_tick").getAsLong() : -1;
+
+                    newAction.jump = json.has("jump") && json.get("jump").getAsBoolean();
                     newAction.left_click = json.has("left_click") && json.get("left_click").getAsBoolean();
                     newAction.right_click = json.has("right_click") && json.get("right_click").getAsBoolean();
+
+                    // Out-of-band reset command (teleport/heal/regear between rounds)
+                    if (json.has("command")) {
+                        pendingCommand = json.get("command").getAsString();
+                    }
 
                     // Put the new command in the mailbox
                     currentAction = newAction;
@@ -115,6 +159,17 @@ public class MLMod {
 
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
+        // END phase: the player's onUpdate() has already run this tick and copied
+        // prevRotation = rotation. Restore prev to the pre-delta angle so the camera
+        // interpolates the sweep across the render frames instead of snapping.
+        if (event.phase == TickEvent.Phase.END) {
+            if (rotationSmoothPending && mc.thePlayer != null) {
+                mc.thePlayer.prevRotationYaw = preYaw;
+                mc.thePlayer.prevRotationPitch = prePitch;
+                rotationSmoothPending = false;
+            }
+            return;
+        }
         if (event.phase != TickEvent.Phase.START || mc.thePlayer == null || mc.theWorld == null) return;
 
         // 2. The Toggle Logic
@@ -136,11 +191,38 @@ public class MLMod {
                 KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.getKeyCode(), false);
                 KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.getKeyCode(), false);
                 KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.getKeyCode(), false);
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.getKeyCode(), false);
+                KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.getKeyCode(), false);
+                rotationSmoothPending = false;  // hand the camera back to vanilla cleanly
             }
         }
 
-        // If a GUI is open or socket is dead, freeze
-        if (mc.currentScreen != null || out == null) return;
+        if (out == null) return;
+
+        // Telemetry must flow EVERY tick, GUI or not - Python blocks on recv, so a
+        // menu pausing telemetry on this client stalls the whole trainer. Note this
+        // stream is NOT lockstep: states go out every tick whether or not Python has
+        // replied, so Python drains to the freshest frame (see pvp_env._recv_state)
+        // instead of consuming a stale backlog. A GUI only suppresses APPLYING
+        // inputs (guiOpen below), never sending.
+        boolean deathScreen = mc.currentScreen instanceof GuiGameOver;
+        boolean guiOpen = mc.currentScreen != null && !deathScreen;
+        // Nobody is around to click Respawn during self-play; click it ourselves.
+        if (deathScreen && isAiActive && mc.thePlayer.getHealth() <= 0.0F) {
+            mc.thePlayer.respawnPlayer();
+        }
+
+        // Run any queued reset commands on the client thread (Minecraft isn't
+        // thread-safe). Python joins them with ";" - split back into one chat
+        // message each, or the server parses the whole line as a single command.
+        if (pendingCommand != null) {
+            String cmd = pendingCommand;
+            pendingCommand = null;
+            for (String part : cmd.split(";")) {
+                String c = part.trim();
+                if (!c.isEmpty()) mc.thePlayer.sendChatMessage(c);
+            }
+        }
 
         EntityPlayer target = null;
         double closestDist = Double.MAX_VALUE;
@@ -157,12 +239,16 @@ public class MLMod {
         }
 
         // 4. Send the State to Python
+        final long thisTick = tickCounter++;
         try {
             JsonObject json = new JsonObject();
 
             // Session bookkeeping - lets Python detect gaps when stacking frames
-            json.addProperty("tick", tickCounter++);
+            json.addProperty("tick", thisTick);
             json.addProperty("recording", isRecording);
+            // Last measured control-loop lag (ticks); healthy 1, phase-locked 2,
+            // -1 until Python starts echoing ack_tick. Lets the trainer log it.
+            json.addProperty("staleness", lastStaleness);
 
             // Game State
             json.addProperty("player_x", mc.thePlayer.posX);
@@ -173,7 +259,9 @@ public class MLMod {
             json.addProperty("on_ground", mc.thePlayer.onGround);
             json.addProperty("my_vx", mc.thePlayer.posX - mc.thePlayer.prevPosX);
             json.addProperty("my_vz", mc.thePlayer.posZ - mc.thePlayer.prevPosZ);
+            json.addProperty("my_vy", mc.thePlayer.posY - mc.thePlayer.prevPosY);
             json.addProperty("my_hurt", mc.thePlayer.hurtTime);
+            json.addProperty("my_health", mc.thePlayer.getHealth());
 
             if (target != null) {
                 json.addProperty("target_x", target.posX);
@@ -181,8 +269,10 @@ public class MLMod {
                 json.addProperty("target_z", target.posZ);
                 json.addProperty("target_dist", closestDist);
                 json.addProperty("tgt_vx", target.posX - target.prevPosX);
+                json.addProperty("tgt_vy", target.posY - target.prevPosY);
                 json.addProperty("tgt_vz", target.posZ - target.prevPosZ);
                 json.addProperty("tgt_hurt", target.hurtTime);
+                json.addProperty("tgt_health", target.getHealth());
             } else {
                 json.addProperty("target_dist", -1.0);
             }
@@ -195,6 +285,7 @@ public class MLMod {
             // actual sprint state, not the keybind - double-tap-W sprinting never
             // presses keyBindSprint, so reading the key logs sprint as always-off
             json.addProperty("in_sprint", mc.thePlayer.isSprinting());
+            json.addProperty("in_jump", mc.gameSettings.keyBindJump.isKeyDown());
             json.addProperty("in_left_click", mc.gameSettings.keyBindAttack.isKeyDown());
             json.addProperty("in_right_click", mc.gameSettings.keyBindUseItem.isKeyDown());
 
@@ -204,32 +295,86 @@ public class MLMod {
         }
 
         // --- APPLY AI ACTIONS ---
-        if (isAiActive) {
+        // Skipped while a menu is open (telemetry above still ran, keeping lockstep);
+        // release the movement keys so the bot doesn't ghost-walk under the GUI.
+        if (isAiActive && guiOpen) {
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.getKeyCode(), false);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.getKeyCode(), false);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.getKeyCode(), false);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.getKeyCode(), false);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.getKeyCode(), false);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.getKeyCode(), false);
+        }
+        if (isAiActive && !guiOpen) {
+            // Anti-phase-lock: the action we SHOULD apply this tick is the reply to
+            // last tick's state (ack == thisTick-1). If it hasn't arrived yet - the
+            // reply is in flight because the other client's tick clock sits just
+            // before ours - wait briefly for it rather than applying a stale action.
+            // lag > 4 means Python is paused (PPO update / reset), not phase-lagged;
+            // ack < 0 means Python isn't echoing (old server) - don't wait for those.
+            long lag = (thisTick - 1) - currentAction.ack_tick;
+            if (currentAction.ack_tick >= 0 && lag >= 1 && lag <= 4) {
+                int waited = 0;
+                while (waited < FRESH_WAIT_MS
+                        && (thisTick - 1) - currentAction.ack_tick >= 1) {
+                    try { Thread.sleep(1); } catch (InterruptedException e) { break; }
+                    waited++;
+                }
+                staleWaitedMs += waited;
+            }
             BotAction action = currentAction;
+
+            // Staleness bookkeeping: summary line every 200 ticks (~10 s).
+            if (action.ack_tick >= 0) {
+                lastStaleness = thisTick - action.ack_tick;
+                staleSum += lastStaleness;
+                staleMax = Math.max(staleMax, lastStaleness);
+                staleTicks++;
+                if (staleTicks >= 200) {
+                    System.out.println(String.format(
+                        "[mlpvp:%d] staleness avg %.2f max %d over %d ticks (waited %d ms)",
+                        aiPort, staleSum / (double) staleTicks, staleMax, staleTicks,
+                        staleWaitedMs));
+                    staleSum = staleMax = staleTicks = staleWaitedMs = 0;
+                }
+            }
 
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindForward.getKeyCode(), action.w);
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindLeft.getKeyCode(), action.a);
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindBack.getKeyCode(), action.s);
             KeyBinding.setKeyBindState(mc.gameSettings.keyBindRight.getKeyCode(), action.d);
-            KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.getKeyCode(), action.sprint);
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindJump.getKeyCode(), action.jump);
 
+            // Sprint: drive the entity flag directly, not the keybind. A toggle-sprint
+            // setup never holds keyBindSprint, so writing that key's state does nothing
+            // (or fights the toggle). setSprinting is what actually gates the 1.3x speed
+            // and the sprint knockback we W-tap to reset.
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindSprint.getKeyCode(), action.sprint);
+            mc.thePlayer.setSprinting(action.sprint && action.w);
+
+            // Remember the pre-delta angle so onClientTick END can restore prevRotation
+            // and the camera interpolates this tick's rotation smoothly (see field docs).
+            preYaw = mc.thePlayer.rotationYaw;
+            prePitch = mc.thePlayer.rotationPitch;
             mc.thePlayer.rotationYaw += (action.yaw_delta * aiAimSensitivity);
             mc.thePlayer.rotationPitch += (action.pitch_delta * aiAimSensitivity);
             // Vanilla mouse input can never push pitch past vertical; neither may the AI
             mc.thePlayer.rotationPitch = Math.max(-90f, Math.min(90f, mc.thePlayer.rotationPitch));
+            rotationSmoothPending = true;
 
+            // Attack is an edge - onTick queues exactly one clickMouse() next runTick.
             if (action.left_click) {
                 KeyBinding.onTick(mc.gameSettings.keyBindAttack.getKeyCode());
             }
-            if (action.right_click) {
-                KeyBinding.onTick(mc.gameSettings.keyBindUseItem.getKeyCode());
-            }
+            // Blocking is a HOLD. onTick fires a single press, which is why sword-block
+            // never engaged; vanilla only blocks while keyBindUseItem.isKeyDown().
+            KeyBinding.setKeyBindState(mc.gameSettings.keyBindUseItem.getKeyCode(), action.right_click);
 
             // Consume impulses so we don't get the helicopter neck bug
             action.yaw_delta = 0;
             action.pitch_delta = 0;
             action.left_click = false;
-            action.right_click = false;
+            action.jump = false;
         }
     }
 }

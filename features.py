@@ -50,15 +50,22 @@ def frame_features(obs):
     my_vf, my_vs = to_local(obs["my_vx"], obs["my_vz"])
     tg_vf, tg_vs = to_local(obs["tgt_vx"], obs["tgt_vz"])
 
+    def clamp(v, lim=3.0):
+        # A network only ever saw roughly [-1, 1] here. Letting a live feature run
+        # to -2.8 (which is what a crosshair buried in the ground does to pitch_err)
+        # puts it deep in extrapolation territory, where it emits nonsense - phantom
+        # S-key, random sprinting. Clamping bounds the damage from a bad state.
+        return max(-lim, min(lim, v))
+
     return [
-        1.0,                                            # has_target
+        1.0,                                                   # has_target
         dist / MAX_RANGE,
-        yaw_err / 30.0,
-        pitch_err / 30.0,
-        (obs["target_y"] - obs["player_y"]) / 4.0,      # height diff (knockback arcs)
+        clamp(yaw_err / 30.0),
+        clamp(pitch_err / 30.0),
+        clamp((obs["target_y"] - obs["player_y"]) / 4.0),      # height diff (knockback arcs)
         float(obs["on_ground"]),
-        my_vf / 0.3, my_vs / 0.3,                       # ~sprint speed = 0.28 blocks/tick
-        tg_vf / 0.3, tg_vs / 0.3,
-        obs["my_hurt"] / 10.0,                          # hurtTime counts down 10 -> 0
-        obs["tgt_hurt"] / 10.0,                         # THE combo-timing signal
+        clamp(my_vf / 0.3), clamp(my_vs / 0.3),                # ~sprint speed = 0.28 blocks/tick
+        clamp(tg_vf / 0.3), clamp(tg_vs / 0.3),
+        obs["my_hurt"] / 10.0,                                 # hurtTime counts down 10 -> 0
+        obs["tgt_hurt"] / 10.0,                                # THE combo-timing signal
     ]
