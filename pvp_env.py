@@ -22,6 +22,7 @@ run worthwhile instead of hopeless.
 import socket
 import json
 import math
+import random
 from collections import deque
 
 import numpy as np
@@ -42,6 +43,11 @@ ACTIONS = [
     (False, False, False, True,  False),  # 5 strafe right
     (False, True,  True,  False, False),  # 6 retreat left
     (False, False, True,  True,  False),  # 7 retreat right
+    # Appended (checkpoints row-pad via adapt_ckpt_move_dim): pure S. The diagonal
+    # retreats above drift sideways; an S-tap is a STRAIGHT momentum kill that holds
+    # the spacing line - the "back off half a step, stay at max reach" move that
+    # separates trading from combo control.
+    (False, False, True,  False, False),  # 8 s-tap straight back
 ]
 N_ACTIONS = len(ACTIONS)
 
@@ -95,6 +101,22 @@ COMBO_BONUS = 0.5     # per combo step, capped at 4 extra hits
 # it achieves it (that's exactly the W-tap skill).
 KB_COEF = 0.4
 KB_NORM = 0.6         # blocks/tick; ~sprint-hit launch speed, so bonus tops out ~KB_COEF
+# Blocked hit: a registered block shows up in the reward only as taken-damage-halved -
+# a counterfactual PPO can barely see at 20Hz. Pay a small explicit bonus when we take
+# a hit WHILE our block is registered (my_block true in the post-hit frame), sharpening
+# the credit for proactive blocking. Small, so "stand there absorbing blocked hits"
+# can never beat not being hit at all (a blocked sword hit still costs ~3.5 - 0.3).
+BLOCKED_HIT_BONUS = 0.3
+# Simulated network latency. On the LAN training rig real ping is ~0, so the ping
+# features would be constant and the policy could never learn latency adaptation.
+# Instead each round samples sim_lag in sim_lag_range (inclusive) and outgoing
+# actions are queued that many ticks before being sent - one tick of action delay
+# adds the same control-loop lag as ~50ms of real RTT, so the equivalent ping is
+# injected into the my_ping/tgt_ping telemetry. That makes the features readable
+# (resampled per round, so the policy must READ them, not memorize a delay) and
+# routes through combat.py's block-hold/crit-shift rules - the exact path used at
+# real ping. Approximation: only OUR actions lag, not the opponent's telemetry.
+SIM_LAG_MS_PER_TICK = 50
 # Aim-residual regularizer: the aim head gets NO entropy bonus (a Gaussian's entropy is
 # just log-std) and nothing else anchors it to 0, so it random-walks into one-sided,
 # state-dependent offsets that fight the computed geometry - the crosshair orbits and
@@ -103,14 +125,36 @@ KB_NORM = 0.6         # blocks/tick; ~sprint-hit launch speed, so bonus tops out
 # (0.036/tick), and pinning the full +-8deg is expensive (0.256/tick, ~a hit over 20
 # ticks) - exactly the ordering we want.
 AIM_RES_COEF = 0.004
+# Whiff penalty: 1.8 hit registration is a client-side ray from the eye through the
+# crosshair against the target's AABB (reach ~3). The mod reports whether that ray
+# connects THIS tick as my_ray_hit. Swinging inside reach while the ray MISSES is a
+# wasted click AND a sign the aim (residual/lead) is pulling the crosshair off the
+# hitbox - so tax it. A dense, direct "keep the crosshair ON the person when you
+# commit" gradient for the aim head, where the sparse landed-hit reward is too slow.
+# Only applied when the mod actually reports my_ray_hit (new jar); absent -> skipped,
+# so an old jar never eats a blanket swing penalty. Small, so it shapes aim without
+# ever discouraging swinging itself (a connecting swing is worth ~6 health).
+WHIFF_PENALTY = 0.05
+WHIFF_RANGE = 3.0     # blocks; matches the mod's 3.0 ray reach - past this a dead-on
+                      # ray legitimately falls short, so no penalty out there
 
 
 class PvPEnv:
-    def __init__(self, port=9999, reset_commands=None, max_ticks=1200, host='127.0.0.1'):
+    def __init__(self, port=9999, reset_commands=None, max_ticks=1200, host='127.0.0.1',
+                 sim_lag_range=(0, 0)):
         self.port = port
         self.host = host
+        # Simulated-latency state (see SIM_LAG_MS_PER_TICK). sim_lag resamples each
+        # reset; peer_lag is the OTHER fighter's sim_lag, set by the self-play
+        # harness so tgt_ping tells the truth about the opponent's delay.
+        self.sim_lag_range = sim_lag_range
+        self.sim_lag = 0
+        self.peer_lag = 0
+        self._action_queue = deque()
         # Chat commands run at the start of each episode (teleport/heal/regear).
         # Needs op on your own world. e.g. ["/tp SelfBot 0 64 0", "/effect SelfBot 6 1 255"]
+        # May also be a CALLABLE returning the list, evaluated once per reset - that's
+        # how the trainer randomizes spawn geometry between rounds.
         self.reset_commands = reset_commands or []
         self.max_ticks = max_ticks
         self.conn = None
@@ -158,7 +202,19 @@ class PvPEnv:
         complete = [l for l in lines[:-1] if l.strip()]
         if not complete:
             return self._recv_state()
-        return json.loads(complete[-1])
+        return self.annotate_ping(json.loads(complete[-1]))
+
+    def annotate_ping(self, state):
+        """Add the simulated latency (ours and the opponent's) on top of the real
+        - on LAN, near-zero - tab-list readings, so the ping features and combat.py's
+        timing rules see the delay the action queue is actually creating."""
+        if self.sim_lag:
+            state["my_ping"] = (max(state.get("my_ping") or 0, 0)
+                                + self.sim_lag * SIM_LAG_MS_PER_TICK)
+        if self.peer_lag and "target_dist" in state and (state["target_dist"] or 0) > 0:
+            state["tgt_ping"] = (max(state.get("tgt_ping") or 0, 0)
+                                 + self.peer_lag * SIM_LAG_MS_PER_TICK)
+        return state
 
     def _send(self, action):
         # Echo the tick of the state this action was computed from (ack_tick). The
@@ -176,14 +232,21 @@ class PvPEnv:
     def reset(self):
         self.combat.reset()
         self.history = deque([[0.0] * FRAME_DIM] * STACK, maxlen=STACK)
+        # Roll this round's simulated latency; in-flight actions from the old round
+        # are dropped (reset commands below bypass the queue on purpose).
+        self.sim_lag = random.randint(*self.sim_lag_range)
+        self._action_queue.clear()
 
         # Fire reset commands piggybacked on an idle action. If a fighter just died
         # the mod auto-respawns it, but a dead/mid-respawn player can't be teleported,
         # so the volley goes out TWICE: the first catches the survivor, the second
         # lands after the respawn. Then idle so the first real observation isn't a
         # mid-teleport frame.
-        reset_msg = ({"command": "; ".join(self.reset_commands)}
-                     if self.reset_commands else {})
+        # Evaluate once per reset (same commands for both volleys, so the respawned
+        # fighter lands on the same spot the survivor was already sent to).
+        cmds = (self.reset_commands() if callable(self.reset_commands)
+                else self.reset_commands)
+        reset_msg = {"command": "; ".join(cmds)} if cmds else {}
         self._send(reset_msg)
         for _ in range(8):
             state = self._recv_state()
@@ -221,10 +284,27 @@ class PvPEnv:
         self._pending_action = action  # step_recv scores it (block cost etc.)
         w, a, s, d, sprint = ACTIONS[int(action["move"])]
         movement = {"w": w, "a": a, "s": s, "d": d, "sprint": sprint}
-        self._send(self.combat.act_policy(
+        mod_action = self.combat.act_policy(
             self.last_state, movement,
             click=bool(action["click"]), block=bool(action["block"]),
-            aim_res=action["aim"]))
+            aim_res=action["aim"])
+        # Simulated latency: hold the BODY inputs (move/click/block/jump) sim_lag
+        # ticks before they reach the mod - that models the ping-delayed control
+        # loop and gives the ping features signal. But the AIM (yaw/pitch) is NOT
+        # delayed: in real Minecraft your own view is client-authoritative and
+        # rotates instantly; ping only makes the OPPONENT you aim at stale, which
+        # the telemetry already reflects. Delaying it also fed a proportional aim
+        # controller (combat.py closes 60%/tick) its own error sim_lag ticks late -
+        # textbook loop instability, so the crosshair overshoots and orbits (the
+        # "spinning"). Pop the delayed body, then stamp THIS tick's fresh aim on it.
+        self._action_queue.append(mod_action)
+        if len(self._action_queue) > self.sim_lag:
+            out = dict(self._action_queue.popleft())
+        else:
+            out = {}  # pipeline still filling: no body inputs yet (dead control loop)
+        out["yaw_delta"] = mod_action["yaw_delta"]
+        out["pitch_delta"] = mod_action["pitch_delta"]
+        self._send(out)
 
     def step_recv(self):
         """Block for the freshest post-action frame and score it. Pairs with
@@ -252,12 +332,25 @@ class PvPEnv:
         if action["block"] and (new_d is None or new_d <= 0.0 or new_d > BLOCK_FREE_RANGE):
             reward -= BLOCK_COST
 
+        # Blocked hit: got hit while our block was registered -> the damage above was
+        # halved; pay the explicit bonus that makes that visible (see constants)
+        if taken > 0.0 and (state.get("my_block") or 0.0):
+            reward += BLOCKED_HIT_BONUS
+
         # Aim-residual tax (see AIM_RES_COEF): penalize the squared residual the policy
         # actually emitted this tick, so the aim head can't drift into a free-floating
         # offset that spins the crosshair. Raw (pre-clamp) value, so the pushback keeps
         # growing even past +-AIM_RES_MAX instead of saturating with the applied clamp.
         res_y, res_p = float(action["aim"][0]), float(action["aim"][1])
         reward -= AIM_RES_COEF * (res_y * res_y + res_p * res_p)
+
+        # Whiff: swung inside reach but the crosshair ray missed the AABB (the exact
+        # client-side hit test, see WHIFF_PENALTY). state.get is None on an old jar
+        # (no my_ray_hit key) -> no penalty; 0.0 = a real miss -> penalized.
+        ray_hit = state.get("my_ray_hit")
+        if (action["click"] and ray_hit is not None and not ray_hit
+                and new_d is not None and 0.0 < new_d <= WHIFF_RANGE):
+            reward -= WHIFF_PENALTY
 
         # First blood, once per round, signed
         if not self.first_hit_done and (dealt > 0.0 or taken > 0.0):

@@ -8,7 +8,7 @@ import torch
 
 # Single source of truth: architecture from train_model, features from features,
 # combat rules from combat.
-from train_model import PvPCloner
+from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
 from features import frame_features, STACK, FRAME_DIM
 from combat import CombatController, idle_action
 from pvp_env import ACTIONS
@@ -40,7 +40,8 @@ def start_bc_bot(host='127.0.0.1', port=9999):
     """Behavioral-cloning bot: learned MOVEMENT + fully computed aim/attack (combat.act)."""
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = PvPCloner().to(device)
-    model.load_state_dict(torch.load('pvp_model_v2.pth', map_location=device))
+    model.load_state_dict(adapt_ckpt_frame_dim(
+        torch.load('pvp_model_v2.pth', map_location=device)))
     model.eval()
     print("BC brain loaded (learned movement + computed aim/attack).")
 
@@ -92,7 +93,8 @@ def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'
     from train_selfplay import ActorCritic, DEVICE
 
     model = ActorCritic().to(DEVICE)
-    model.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+    model.load_state_dict(adapt_ckpt_move_dim(
+        adapt_ckpt_frame_dim(torch.load(ckpt, map_location=DEVICE)), len(ACTIONS)))
     model.eval()
     print(f"Self-play brain loaded from {ckpt} (learned movement + attack/block/aim).")
 
