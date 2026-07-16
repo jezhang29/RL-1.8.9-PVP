@@ -9,15 +9,17 @@ import os
 # features without re-recording. Frames without a target are logged too,
 # so frame stacks stay contiguous when someone briefly runs out of range.
 
-CSV_PATH = 'pvp_dataset_v2.csv'
+# v3 adds my_vy / my_health / tgt_health / out_jump, so it gets its own file -
+# appending these rows to the v2 CSV would silently shift every column.
+CSV_PATH = 'pvp_dataset_v3.csv'
 
 FIELDNAMES = [
     'tick',
     'player_x', 'player_y', 'player_z', 'player_yaw', 'player_pitch',
-    'on_ground', 'my_vx', 'my_vz', 'my_hurt',
+    'on_ground', 'my_vx', 'my_vy', 'my_vz', 'my_hurt', 'my_health',
     'target_x', 'target_y', 'target_z', 'target_dist',
-    'tgt_vx', 'tgt_vz', 'tgt_hurt',
-    'out_w', 'out_a', 'out_s', 'out_d', 'out_sprint',
+    'tgt_vx', 'tgt_vz', 'tgt_hurt', 'tgt_health',
+    'out_w', 'out_a', 'out_s', 'out_d', 'out_sprint', 'out_jump',
     'out_left_click', 'out_right_click'
 ]
 
@@ -66,8 +68,10 @@ def start_data_logger(host='127.0.0.1', port=9999):
                     'player_pitch': round(obs["player_pitch"], 3),
                     'on_ground': int(obs.get("on_ground", True)),
                     'my_vx': round(obs["my_vx"], 4),
+                    'my_vy': round(obs["my_vy"], 4),
                     'my_vz': round(obs["my_vz"], 4),
                     'my_hurt': obs["my_hurt"],
+                    'my_health': round(obs["my_health"], 2),
                     'target_x': obs["target_x"] if has_target else '',
                     'target_y': obs["target_y"] if has_target else '',
                     'target_z': obs["target_z"] if has_target else '',
@@ -75,12 +79,14 @@ def start_data_logger(host='127.0.0.1', port=9999):
                     'tgt_vx': round(obs["tgt_vx"], 4) if has_target else '',
                     'tgt_vz': round(obs["tgt_vz"], 4) if has_target else '',
                     'tgt_hurt': obs["tgt_hurt"] if has_target else '',
+                    'tgt_health': round(obs["tgt_health"], 2) if has_target else '',
 
                     'out_w': int(obs["in_w"]),
                     'out_a': int(obs["in_a"]),
                     'out_s': int(obs["in_s"]),
                     'out_d': int(obs["in_d"]),
                     'out_sprint': int(obs["in_sprint"]),
+                    'out_jump': int(obs["in_jump"]),
                     'out_left_click': int(obs["in_left_click"]),
                     'out_right_click': int(obs["in_right_click"])
                 })

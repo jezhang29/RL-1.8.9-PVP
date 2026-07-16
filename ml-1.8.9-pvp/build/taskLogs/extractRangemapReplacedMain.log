@@ -1,3 +1,4 @@
 Symbol range map extraction starting
 Processing 1 files
 processing net/soupchugger/ml/MLMod.java
+Unmatched newcode end: 2529: // tick END we restore prevRotation to the PRE-delta angle so the vanilla camera

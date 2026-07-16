@@ -102,7 +102,11 @@ class PvPDataset(Dataset):
 KEY_NAMES = ['W', 'A', 'S', 'D', 'Sprint', 'L_Click', 'R_Click']
 
 def train():
-    dataset = PvPDataset('pvp_dataset_v2.csv')
+    # Prefer v3 (has jump/health) once it exists; v2 still trains the movement head fine.
+    import os
+    csv_path = 'pvp_dataset_v3.csv' if os.path.isfile('pvp_dataset_v3.csv') else 'pvp_dataset_v2.csv'
+    print(f"Using {csv_path}")
+    dataset = PvPDataset(csv_path)
 
     # Split by time, not at random: consecutive ticks are nearly identical, so a
     # random split leaks almost every val sample into the train set and the val
