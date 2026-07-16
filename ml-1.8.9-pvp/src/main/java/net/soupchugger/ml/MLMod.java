@@ -4,9 +4,12 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGameOver;
+import net.minecraft.client.network.NetworkPlayerInfo;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.entity.player.EntityPlayer;
+import net.minecraft.util.BlockPos;
 import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.Vec3;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.client.registry.ClientRegistry;
 import net.minecraftforge.fml.common.Mod;
@@ -157,6 +160,52 @@ public class MLMod {
         }).start();
     }
 
+    // Tab-list round-trip ping in ms; -1 until the server's player-info packet
+    // arrives. OUR ping shifts WHEN our inputs register server-side (combat.py
+    // extends block hold / crit timing by it); the TARGET's ping shifts how stale
+    // their rendered position and reactions are - both go to Python as features.
+    private int pingOf(EntityPlayer player) {
+        if (mc.getNetHandler() == null) return -1;
+        NetworkPlayerInfo info = mc.getNetHandler().getPlayerInfo(player.getUniqueID());
+        return info != null ? info.getResponseTime() : -1;
+    }
+
+    // Distance (blocks) to the first solid block along a horizontal direction from
+    // a player - "is there a wall at their back". A cornered player takes no real
+    // knockback, which changes the combo/spacing math, so both fighters' back-lanes
+    // (along the knockback axis attacker->victim) are reported. Scans in half-block
+    // steps at shin and head height; -1 = open for at least 3 blocks.
+    private double wallDistance(EntityPlayer from, double dirX, double dirZ) {
+        double mag = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        if (mag < 1e-6) return -1.0;
+        dirX /= mag; dirZ /= mag;
+        for (double d = 0.5; d <= 3.0; d += 0.5) {
+            double x = from.posX + dirX * d;
+            double z = from.posZ + dirZ * d;
+            if (isSolid(x, from.posY + 0.5, z) || isSolid(x, from.posY + 1.5, z)) {
+                return d;
+            }
+        }
+        return -1.0;
+    }
+
+    private boolean isSolid(double x, double y, double z) {
+        return mc.theWorld.getBlockState(new BlockPos(x, y, z))
+                .getBlock().getMaterial().blocksMovement();
+    }
+
+    // Does `looker`'s crosshair ray (out to `reach` blocks) pass through `victim`'s
+    // hitbox? Ignores occluding blocks - it's "aim is on them", not "hit guaranteed".
+    // For US this is exactly 1.8's hit selection (a client-side eye raytrace with
+    // 3-block reach), i.e. "a click right now connects"; for the TARGET it means
+    // "they can hit us the moment they click" - the trigger proactive blocking needs.
+    private boolean lookRayHits(EntityPlayer looker, EntityPlayer victim, double reach) {
+        Vec3 eye = new Vec3(looker.posX, looker.posY + looker.getEyeHeight(), looker.posZ);
+        Vec3 look = looker.getLook(1.0F);
+        Vec3 end = eye.addVector(look.xCoord * reach, look.yCoord * reach, look.zCoord * reach);
+        return victim.getEntityBoundingBox().calculateIntercept(eye, end) != null;
+    }
+
     @SubscribeEvent
     public void onClientTick(TickEvent.ClientTickEvent event) {
         // END phase: the player's onUpdate() has already run this tick and copied
@@ -262,6 +311,13 @@ public class MLMod {
             json.addProperty("my_vy", mc.thePlayer.posY - mc.thePlayer.prevPosY);
             json.addProperty("my_hurt", mc.thePlayer.hurtTime);
             json.addProperty("my_health", mc.thePlayer.getHealth());
+            // Sprint = the knockback-bonus flag; block = using item (half damage,
+            // 20% movement). Both are entity state, so they read correctly for the
+            // remote player too (use-item syncs via the eating flag, sprint via
+            // entity flags - that's how you can SEE other players block/sprint).
+            json.addProperty("my_sprint", mc.thePlayer.isSprinting());
+            json.addProperty("my_block", mc.thePlayer.isBlocking());
+            json.addProperty("my_ping", pingOf(mc.thePlayer));
 
             if (target != null) {
                 json.addProperty("target_x", target.posX);
@@ -273,6 +329,27 @@ public class MLMod {
                 json.addProperty("tgt_vz", target.posZ - target.prevPosZ);
                 json.addProperty("tgt_hurt", target.hurtTime);
                 json.addProperty("tgt_health", target.getHealth());
+                json.addProperty("tgt_sprint", target.isSprinting());
+                json.addProperty("tgt_block", target.isBlocking());
+                json.addProperty("tgt_ping", pingOf(target));
+                // Swing animation syncs to all clients - this is "they're attacking
+                // RIGHT NOW", the signal proactive blocking has to key off.
+                json.addProperty("tgt_swing", target.isSwingInProgress);
+                // Where the target is looking (features.py turns this into
+                // "how far are they looking away from me")
+                json.addProperty("tgt_yaw", target.rotationYaw);
+                // Back-lanes along the knockback axis: a hit launches the victim
+                // AWAY from the attacker, so scan behind each fighter on that line.
+                double kbX = target.posX - mc.thePlayer.posX;
+                double kbZ = target.posZ - mc.thePlayer.posZ;
+                json.addProperty("tgt_wall", wallDistance(target, kbX, kbZ));
+                json.addProperty("my_wall", wallDistance(mc.thePlayer, -kbX, -kbZ));
+                // Remote onGround is driven by the server's movement packets - it's
+                // the airborne/juggle state (air friction 0.91 vs ~0.546 grounded,
+                // so airborne victims fly ~4x further per hit).
+                json.addProperty("tgt_on_ground", target.onGround);
+                json.addProperty("my_ray_hit", lookRayHits(mc.thePlayer, target, 3.0));
+                json.addProperty("tgt_ray_hit", lookRayHits(target, mc.thePlayer, 3.0));
             } else {
                 json.addProperty("target_dist", -1.0);
             }

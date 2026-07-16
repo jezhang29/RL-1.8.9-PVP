@@ -7,6 +7,65 @@ import numpy as np
 
 from features import frame_features, wrap_degrees, STACK, INPUT_DIM
 
+
+def adapt_ckpt_frame_dim(state_dict, new_input_dim=INPUT_DIM, stack=STACK):
+    """Column-remap a checkpoint saved under a smaller FRAME_DIM.
+
+    The obs vector is STACK frames laid out back to back, so growing FRAME_DIM
+    moves every frame's columns in the FIRST linear layer (old col f*old+k lives
+    at f*new+k now). Copy the old columns into place and zero the new-feature
+    columns: the loaded net then computes EXACTLY what it did before (new features
+    contribute 0) and learns to use them from there. Works for both PvPCloner and
+    the self-play ActorCritic - both start with base.0 = Linear(input, 512) and
+    nothing else touches the input width. New features must only ever be APPENDED
+    within a frame for this to hold.
+    """
+    key = "base.0.weight"
+    w = state_dict.get(key)
+    if w is None or w.shape[1] == new_input_dim:
+        return state_dict
+    old_frame, new_frame = w.shape[1] // stack, new_input_dim // stack
+    if old_frame > new_frame or w.shape[1] % stack:
+        raise ValueError(f"can't adapt {key} from {w.shape[1]} to {new_input_dim} inputs")
+    new_w = torch.zeros(w.shape[0], new_input_dim, dtype=w.dtype)
+    for f in range(stack):
+        new_w[:, f * new_frame : f * new_frame + old_frame] = \
+            w[:, f * old_frame : (f + 1) * old_frame]
+    state_dict = dict(state_dict)
+    state_dict[key] = new_w
+    print(f"Adapted checkpoint: {old_frame} -> {new_frame} features/frame "
+          f"(new feature columns zero-initialized).")
+    return state_dict
+
+
+def adapt_ckpt_move_dim(state_dict, new_n):
+    """Row-pad a checkpoint's move head after new movement primitives are APPENDED
+    to pvp_env.ACTIONS (pass new_n = the current N_ACTIONS).
+
+    New rows are zero-init -> logit 0 for the new moves: existing action logits are
+    untouched, and the new primitive starts at a modest sampling probability - live
+    exploration, not disruption. Same append-only contract as frame features: new
+    ACTIONS entries must only ever be added at the END of the list. No-op for
+    checkpoints without a move head (PvPCloner) or already at new_n.
+    """
+    w = state_dict.get("move_head.weight")
+    if w is None or w.shape[0] == new_n:
+        return state_dict
+    if w.shape[0] > new_n:
+        raise ValueError(f"can't adapt move_head from {w.shape[0]} to {new_n} actions")
+    state_dict = dict(state_dict)
+    new_w = torch.zeros(new_n, w.shape[1], dtype=w.dtype)
+    new_w[:w.shape[0]] = w
+    state_dict["move_head.weight"] = new_w
+    b = state_dict["move_head.bias"]
+    new_b = torch.zeros(new_n, dtype=b.dtype)
+    new_b[:b.shape[0]] = b
+    state_dict["move_head.bias"] = new_b
+    print(f"Adapted checkpoint: {w.shape[0]} -> {new_n} movement actions "
+          f"(new action logits zero-initialized).")
+    return state_dict
+
+
 # 1. Define the Neural Network Architecture
 class PvPCloner(nn.Module):
     def __init__(self):

@@ -25,8 +25,13 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical, Normal
 
-from pvp_env import PvPEnv, OBS_DIM, ACTION_DIMS
-from train_model import PvPCloner
+from pvp_env import PvPEnv, OBS_DIM, ACTION_DIMS, KILL_REWARD, DEATH_REWARD
+from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
+
+# Simulated-latency range (ticks of action delay, ~50ms RTT each) for BOTH fighters,
+# resampled per round - see pvp_env.SIM_LAG_MS_PER_TICK. 0-4 covers LAN through
+# ~200ms, the range friends-over-internet actually shows up with.
+SIM_LAG_RANGE = (0, 4)
 
 # --- hyperparameters --------------------------------------------------------
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -74,14 +79,29 @@ def append_metrics(row, path=METRICS_CSV):
 # just errors in chat.
 # 23 = saturation: refills hunger so sprint (needs >6 food) never dies out and nobody
 # starves during a long run.
-RESET_COMMANDS = [
-    "/tp SantiagoSea 0 65 -2",
-    "/tp Bee__Bot 0 65 8",
-    "/effect SantiagoSea 6 1 5",
-    "/effect Bee__Bot 6 1 5",
-    "/effect SantiagoSea 23 1 9",
-    "/effect Bee__Bot 23 1 9",
-]
+#
+# Spawns are JITTERED each round. Fixed spawns make every opening an exact mirror,
+# so who lands the first hit is a coin flip and the policy only ever sees one
+# approach geometry. Small random offsets vary distance (6-14 blocks) and angle
+# while staying near the original pad; the cap keeps spawn distance under the
+# 16-block feature range. Widen X_JITTER/Z_JITTER if the arena allows.
+X_JITTER = 3
+Z_JITTER = 2
+
+
+def reset_commands():
+    ax = random.randint(-X_JITTER, X_JITTER)
+    az = -2 + random.randint(-Z_JITTER, Z_JITTER)
+    bx = random.randint(-X_JITTER, X_JITTER)
+    bz = 8 + random.randint(-Z_JITTER, Z_JITTER)
+    return [
+        f"/tp SantiagoSea {ax} 65 {az}",
+        f"/tp Bee__Bot {bx} 65 {bz}",
+        "/effect SantiagoSea 6 1 5",
+        "/effect Bee__Bot 6 1 5",
+        "/effect SantiagoSea 23 1 9",
+        "/effect Bee__Bot 23 1 9",
+    ]
 
 
 # --- network ----------------------------------------------------------------
@@ -172,7 +192,8 @@ def warm_start_from_bc(model, path="pvp_model_v2.pth"):
     """
     try:
         bc = PvPCloner()
-        bc.load_state_dict(torch.load(path, map_location="cpu"))
+        # adapt: BC weights may predate newly appended per-frame features
+        bc.load_state_dict(adapt_ckpt_frame_dim(torch.load(path, map_location="cpu")))
     except FileNotFoundError:
         print("No BC checkpoint found - starting from random weights.")
         return
@@ -203,6 +224,11 @@ class SelfPlayHarness:
         # Learner env issues the teleport/heal for BOTH fighters; opp just re-syncs.
         obs = self.learner.reset()
         self.opp_obs = self.opp.reset()
+        # Cross-wire the simulated lags so each fighter's tgt_ping reports the
+        # OTHER's delay (a round late on the reset frames themselves; those are
+        # idle-teleport frames, so nothing meaningful reads it early).
+        self.learner.peer_lag = self.opp.sim_lag
+        self.opp.peer_lag = self.learner.sim_lag
         return obs
 
     def step(self, learner_action):
@@ -221,9 +247,25 @@ class SelfPlayHarness:
         # crosshair overshoot/orbit (the opponent, dispatched first, tracked clean).
         self.opp.step_send(opp_action)
         self.learner.step_send(learner_action)
-        self.opp_obs, _, opp_done, _ = self.opp.step_recv()
+        self.opp_obs, _, opp_done, opp_info = self.opp.step_recv()
         obs, reward, done, info = self.learner.step_recv()
-        # If either fighter died, the round is over for both
+        # If either fighter died, the round is over for both. The two clients see
+        # the same death on different ticks: the victim's own client gets its health
+        # packet a tick or two before the killer's client sees the synced entity
+        # health hit zero - and the mod insta-respawns, so the killer's env can miss
+        # the zero-health frame entirely. When only the OPPONENT env saw the
+        # terminal, credit the learner now; without this, those rounds pay no
+        # KILL/DEATH reward and fall out of the winrate as result "?".
+        if opp_done and not done:
+            opp_result = opp_info.get("result")
+            if opp_result == "death":       # opponent died -> we killed it
+                info["result"] = "kill"
+                reward += KILL_REWARD
+            elif opp_result == "kill":      # opponent killed us
+                info["result"] = "death"
+                reward += DEATH_REWARD
+            else:
+                info.setdefault("result", opp_result or "timeout")
         return obs, reward, done or opp_done, info
 
     def resync(self):
@@ -258,7 +300,7 @@ def _drain(env):
     if latest is not None:
         import json
         from features import frame_features
-        env.last_state = json.loads(latest)
+        env.last_state = env.annotate_ping(json.loads(latest))
         env.history.append(frame_features(env.last_state))
 
 
@@ -370,8 +412,10 @@ def collect_rollout(harness, model, n_steps, state):
 
 
 def main():
-    learner_env = PvPEnv(port=LEARNER_PORT, reset_commands=RESET_COMMANDS)
-    opp_env = PvPEnv(port=OPPONENT_PORT, reset_commands=[])
+    learner_env = PvPEnv(port=LEARNER_PORT, reset_commands=reset_commands,
+                         sim_lag_range=SIM_LAG_RANGE)
+    opp_env = PvPEnv(port=OPPONENT_PORT, reset_commands=[],
+                     sim_lag_range=SIM_LAG_RANGE)
     print("Start the LEARNER client, then the OPPONENT client (they connect in order).")
     learner_env.connect()
     opp_env.connect()
@@ -382,7 +426,9 @@ def main():
     # Resume from the last self-play checkpoint if there is one, so restarting the
     # trainer (reward tweaks, crashes) continues the run instead of starting over.
     try:
-        model.load_state_dict(torch.load("pvp_selfplay_latest.pth", map_location=DEVICE))
+        model.load_state_dict(adapt_ckpt_move_dim(adapt_ckpt_frame_dim(
+            torch.load("pvp_selfplay_latest.pth", map_location=DEVICE)),
+            ACTION_DIMS["move"]))
         print("Resumed from pvp_selfplay_latest.pth")
     except FileNotFoundError:
         print("No self-play checkpoint - starting from the BC warm start.")

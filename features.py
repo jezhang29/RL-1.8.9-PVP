@@ -4,7 +4,7 @@ import math
 # Both import from here so training and inference can never drift apart.
 
 STACK = 8          # ticks of history fed to the network (0.4s at 20Hz)
-FRAME_DIM = 12     # features per tick, see frame_features()
+FRAME_DIM = 27     # features per tick, see frame_features()
 INPUT_DIM = STACK * FRAME_DIM
 MAX_RANGE = 16.0   # blocks; beyond this the bot has no data and idles
 
@@ -57,6 +57,35 @@ def frame_features(obs):
         # S-key, random sprinting. Clamping bounds the damage from a bad state.
         return max(-lim, min(lim, v))
 
+    # --- v3 appended block: ping / opponent intent / wall context. Every one of
+    # these reads 0 from old jars and old CSVs (absent key or -1 sentinel), and 0
+    # must mean "neutral / LAN / nothing there" so remapped old checkpoints keep
+    # computing exactly what they did before.
+    def ping01(key):
+        # Tab-list round-trip in ms -> 1.0 at 200ms; -1/absent (LAN, old jar) -> 0
+        p = obs.get(key)
+        return clamp(max(p or 0.0, 0.0) / 200.0)
+
+    # How far the target is looking AWAY from us: 0 = staring at us, 1 = back
+    # turned. Absent (old jar/CSV) -> 0 = the worst-case "they see us" assumption.
+    tgt_yaw_raw = obs.get("tgt_yaw")
+    if tgt_yaw_raw is None:
+        facing_away = 0.0
+    else:
+        bearing_tgt_to_me = math.degrees(math.atan2(
+            -(obs["player_x"] - obs["target_x"]),
+            obs["player_z"] - obs["target_z"]))
+        facing_away = abs(wrap_degrees(bearing_tgt_to_me - tgt_yaw_raw)) / 180.0
+
+    def wall01(key):
+        # Mod sends blocks-to-first-solid along the knockback lane, in (0, 3];
+        # -1/absent = open. Inverted to "wall pressure" so 0 stays neutral: 0.83
+        # pinned against the wall, 0 nothing within 3 blocks.
+        d = obs.get(key)
+        if d is None or d <= 0.0:
+            return 0.0
+        return 1.0 - min(d, 3.0) / 3.0
+
     return [
         1.0,                                                   # has_target
         dist / MAX_RANGE,
@@ -68,4 +97,29 @@ def frame_features(obs):
         clamp(tg_vf / 0.3), clamp(tg_vs / 0.3),
         obs["my_hurt"] / 10.0,                                 # hurtTime counts down 10 -> 0
         obs["tgt_hurt"] / 10.0,                                # THE combo-timing signal
+        # Sprint/block state, both fighters (needs the updated jar; absent keys -> 0,
+        # so old CSVs and old jars keep working). Sprint = the knockback-bonus flag
+        # we manage with W-taps; block = using-item, i.e. moving at 20% speed and
+        # taking half damage. Appended at the END of the frame so checkpoints trained
+        # on the 12-feature layout can be column-remapped (adapt_ckpt_frame_dim).
+        float(obs.get("my_sprint") or 0.0),
+        float(obs.get("tgt_sprint") or 0.0),
+        float(obs.get("my_block") or 0.0),
+        float(obs.get("tgt_block") or 0.0),
+        # v3 appended block (see helpers above); append-only, per convention
+        ping01("my_ping"),
+        ping01("tgt_ping"),
+        float(obs.get("tgt_swing") or 0.0),                    # they're mid-attack NOW
+        facing_away,
+        wall01("my_wall"),                                     # am I getting cornered
+        wall01("tgt_wall"),                                    # are THEY cornered
+        # v4 appended block: vertical velocity, target air state, mutual ray checks.
+        # vy/0.4: jump launch ~ +1, knockback arc peak ~ +1 (base KB caps vy at 0.4)
+        clamp((obs.get("my_vy") or 0.0) / 0.4),
+        clamp((obs.get("tgt_vy") or 0.0) / 0.4),
+        # Airborne = mid-knockback/juggleable (air friction 0.91 vs ~0.55 grounded).
+        # Inverted from on_ground so absent (old jar/CSV) -> 0 = grounded = neutral.
+        0.0 if obs.get("tgt_on_ground") is None else 1.0 - float(obs["tgt_on_ground"]),
+        float(obs.get("my_ray_hit") or 0.0),                   # a click right now connects
+        float(obs.get("tgt_ray_hit") or 0.0),                  # THEIR next click connects
     ]

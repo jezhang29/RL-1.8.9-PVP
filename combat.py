@@ -23,6 +23,12 @@ MAX_PITCH = 20.0
 # lag reads as "aim trails then overshoots". Lead both fighters by their current
 # velocity x this many ticks so the crosshair points where things WILL be when the
 # correction lands. tgt_vy needs the updated mod; absent it we lead horizontally.
+# Deliberately NOT scaled by ping: 1.8 hit selection is a CLIENT-side raytrace
+# (3-block reach against the entity as this client renders it; the server only
+# sanity-checks ~6 blocks in processUseEntity), so hitting the rendered - delayed -
+# image registers fine, and leading past that hitbox just makes the raytrace miss.
+# Ping shifts WHEN inputs land server-side, not where to point; see _uplink_ticks/
+# _rtt_ticks below for the timing rules that do scale with it.
 AIM_LEAD_TICKS = 2.0
 # ...but CAP the lead displacement. A hit spikes the target's velocity (self-play pays
 # for knockback, so launches are big), and an uncapped 2-tick projection then throws the
@@ -54,7 +60,39 @@ WTAP_TICKS = 1      # ticks to drop W+sprint after a hit (sprint-knockback reset
 BLOCK_TICKS = 3     # ticks to hold block after a hit (blockhit, rule mode)
 BLOCK_MIN_TICKS = 3 # policy mode: min hold once block is chosen, so the SERVER
                     # registers the block (reduction is server-side, see act_policy)
-CRIT_GAP = 12       # ticks between crit jumps
+# Crit jump. A hit only crits while FALLING (fallDistance>0 && !onGround - verified in
+# EntityPlayer.attackTargetEntityWithCurrentItem), and after we land a hit the victim
+# can't take damage again until their hurtTime (10 -> 0) reaches 0. A jump is ~12
+# ticks: ~6 up, ~6 falling. So the ONLY profitable jump is right after our own hit,
+# timed so the falling half overlaps the reopening damage window: leave the ground at
+# tgt_hurt ~6-8 and we're falling from tgt_hurt ~0 onward, crit ready. Every other
+# jump at close range is pure downside - airborne means ~1/5 the input authority and
+# 0.91/tick friction, so a hit taken mid-jump becomes a full knockback flight (the
+# old jump-every-CRIT_GAP-ticks-in-reach rule kept both bots airborne mid-trade,
+# which is exactly the "both fly back and reset" pattern). Grounded + holding toward
+# the attacker is the anti-knockback posture; stay on the floor unless juggling.
+CRIT_HURT_HI = 8    # jump while target hurtTime is in [LO, HI] (counting down)...
+CRIT_HURT_LO = 5
+CRIT_RANGE = 4.5    # ...and they're still close enough to chase the crit down
+CRIT_GAP = 12       # min ticks between crit jumps (one jump per i-frame cycle)
+
+
+TICK_MS = 50.0
+
+def _uplink_ticks(obs):
+    """Ticks for one of OUR packets to reach the server: half the tab-list RTT.
+    0 on LAN or with an old jar (no my_ping key). Block reduction is decided
+    server-side, so a block must be held this much LONGER to cover the same
+    server-side window it covers at 0 ping."""
+    ping = obs.get("my_ping") or 0
+    return int(math.ceil(max(ping, 0.0) / 2.0 / TICK_MS))
+
+def _rtt_ticks(obs):
+    """Our full round trip in ticks. The observed tgt_hurt is downlink-stale AND
+    our next attack registers uplink-late, so in observed-hurtTime terms every
+    server-side timing window sits one full RTT earlier than it reads."""
+    ping = obs.get("my_ping") or 0
+    return int(round(max(ping, 0.0) / TICK_MS))
 
 
 def clamp(v, lo, hi):
@@ -129,10 +167,8 @@ class CombatController:
         tgt_hurt = obs.get("tgt_hurt", 0) or 0
         if tgt_hurt > self.prev_tgt_hurt:
             self.wtap_left = WTAP_TICKS
-            self.block_left = BLOCK_TICKS
+            self.block_left = BLOCK_TICKS + _uplink_ticks(obs)
         self.prev_tgt_hurt = tgt_hurt
-
-        in_reach = dist <= REACH
 
         # --- Attack: swing through the approach, CPS-capped with jitter ---
         swinging = dist <= SWING_RANGE and abs(yaw_err) <= SWING_YAW
@@ -153,13 +189,31 @@ class CombatController:
             action["right_click"] = True
             self.block_left -= 1
 
-        # --- Crit: jump so the follow-up lands while falling (1.5x) ---
+        # --- Crit: jump only while juggling, timed to the i-frame reopen (see CRIT_*) ---
         self.ticks_since_jump += 1
-        if in_reach and obs.get("on_ground", False) and self.ticks_since_jump >= CRIT_GAP:
+        if self._crit_jump(obs, dist):
             action["jump"] = True
             self.ticks_since_jump = 0
 
         return action
+
+    def _crit_jump(self, obs, dist):
+        """True when a jump right now yields a falling crit as the target's damage
+        window reopens: we just hit them (their hurtTime mid-countdown), we're
+        grounded and unhurt (not mid-knockback ourselves), and they're chaseable."""
+        tgt_hurt = obs.get("tgt_hurt", 0) or 0
+        my_hurt = obs.get("my_hurt", 0) or 0
+        # Ping shifts the whole window earlier in OBSERVED-hurt terms (see
+        # _rtt_ticks); hurtTime tops out at 10, so past ~100ms the window clips
+        # and the crit is simply attempted as early as the readout allows.
+        shift = _rtt_ticks(obs)
+        hurt_hi = min(10, CRIT_HURT_HI + shift)
+        hurt_lo = min(hurt_hi, CRIT_HURT_LO + shift)
+        return (hurt_lo <= tgt_hurt <= hurt_hi
+                and my_hurt == 0
+                and dist <= CRIT_RANGE
+                and obs.get("on_ground", False)
+                and self.ticks_since_jump >= CRIT_GAP)
 
     def act_policy(self, obs, movement, click, block, aim_res):
         """Self-play variant: the RL policy owns attack, block, W-tap and an aim
@@ -201,15 +255,14 @@ class CombatController:
         # Once the policy commits to a block, hold it for BLOCK_MIN_TICKS so the server
         # actually sees it (the policy re-choosing block just keeps refreshing this).
         if block:
-            self.block_left = BLOCK_MIN_TICKS
+            self.block_left = BLOCK_MIN_TICKS + _uplink_ticks(obs)
         action["right_click"] = self.block_left > 0
         if self.block_left > 0:
             self.block_left -= 1
 
-        # --- Crit: still computed (a periodic jump, not a thing worth learning) ---
-        in_reach = dist <= REACH
+        # --- Crit: still computed, but combo-gated and i-frame-timed (see CRIT_*) ---
         self.ticks_since_jump += 1
-        if in_reach and obs.get("on_ground", False) and self.ticks_since_jump >= CRIT_GAP:
+        if self._crit_jump(obs, dist):
             action["jump"] = True
             self.ticks_since_jump = 0
 
