@@ -15,6 +15,7 @@ See the two-client setup notes at the bottom before running.
 """
 import copy
 import csv
+import glob
 import os
 import random
 import select
@@ -28,13 +29,7 @@ from torch.distributions import Categorical, Normal
 
 from features import frame_features
 from pvp_env import PvPEnv, OBS_DIM, ACTION_DIMS, KILL_REWARD, DEATH_REWARD
-from train_model import (PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim,
-                         adapt_ckpt_add_jump_head)
-
-# Initial log-bias for the jump head's "jump" logit (weights zero-init). softmax([0,
-# -3])[1] ~= 5%, so a fresh/resumed policy jumps rarely and LEARNS the crit timing,
-# instead of the 50% a plain zero-init head would give (constant hopping = airborne).
-JUMP_INIT_BIAS = -3.0
+from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
 
 # Simulated-latency range (ticks of action delay, ~50ms RTT each) for BOTH fighters,
 # resampled per round - see pvp_env.SIM_LAG_MS_PER_TICK. 0-4 covers LAN through
@@ -56,10 +51,16 @@ SPAWN_PROT_TICKS = 60
 # monoculture - measured: blk collapsed 5% -> 0% over one night, because no snapshot
 # ever blocks, so blocking never shows its value AND the counter to a blocker is
 # never in the training data. A human turtling (hold block, click on cooldown) then
-# wins every trade 2:1. The turtle is weighted heaviest for exactly that reason.
-SCRIPTED_PROB = 0.35
-SCRIPTED_STYLES = ("turtle", "rusher", "kiter")
-SCRIPTED_WEIGHTS = (2, 1, 1)   # turtle = the strategy that beats us today
+# wins every trade 2:1.
+# Jul 17 rebalance: wr_script hit 86% mean with HALF of updates at 100% - all three
+# original styles are farmed, so the scripted rounds had stopped producing gradient
+# (and the counters that farm them fold instantly against a real human). The boxer
+# (strafe mixups + W-tap + block-hit + irregular aggression bursts) is the new
+# pressure and is weighted with the turtle; prob raised 0.35 -> 0.45 because the
+# snapshot pool is the part that is a monoculture, not the scripts.
+SCRIPTED_PROB = 0.45
+SCRIPTED_STYLES = ("turtle", "rusher", "kiter", "boxer")
+SCRIPTED_WEIGHTS = (2, 1, 1, 2)
 
 # --- hyperparameters --------------------------------------------------------
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -92,7 +93,18 @@ METRICS_CSV = "selfplay_metrics.csv"
 METRICS_HEADER = ["update", "rounds", "timeouts", "winrate", "wr_old", "wr_new",
                   "wr_script", "wr_pin", "dealt", "taken", "hits", "mean_combo", "max_combo",
                   "blk", "clk", "jmp", "whiff", "aim_bias", "avg_reward",
-                  "ploss", "vloss", "staleness"]
+                  "ploss", "vloss", "staleness",
+                  # Jul 17 additions. Per-style winrates: the aggregate wr_script hid
+                  # "turtle farmed, boxer unbeaten". Entropies (nats): the direct "is
+                  # it still exploring?" readout the log never had - ent_move healthy
+                  # range ~1.0-2.0, near-0 = frozen policy. res_yaw/res_pitch: mean
+                  # LEARNED aim offset (deg) - compare against aim_bias to see whether
+                  # the residual is actually canceling the systematic miss.
+                  # move_top_frac: share of the single most-used movement primitive
+                  # (movement-collapse detector, 1/9 = uniform, ~1.0 = one key held).
+                  "wr_turtle", "wr_rusher", "wr_kiter", "wr_boxer",
+                  "ent_move", "ent_click", "ent_block", "ent_jump",
+                  "aim_std", "res_yaw", "res_pitch", "move_top", "move_top_frac"]
 
 
 def append_metrics(row, path=METRICS_CSV):
@@ -191,11 +203,12 @@ reset_commands = open_spawn
 
 # --- network ----------------------------------------------------------------
 class ActorCritic(nn.Module):
-    """Multi-head actor-critic. One shared feature trunk feeds five action heads
-    (movement, click, block, jump, and a continuous aim residual) plus the value head.
-    The heads are treated as INDEPENDENT given the state, so the joint log-prob is
-    the sum of the per-head log-probs and the joint entropy the sum of entropies -
-    standard factorized-policy PPO.
+    """Multi-head actor-critic. One shared feature trunk feeds four action heads
+    (movement, click, a defensive-block posture, and a continuous aim residual) plus
+    the value head. The heads are treated as INDEPENDENT given the state, so the joint
+    log-prob is the sum of the per-head log-probs and the joint entropy the sum of
+    entropies - standard factorized-policy PPO. (There is no jump head: crit-jump is a
+    scripted reflex, see combat.act_policy - the Jul 17 re-hybridization.)
     """
 
     def __init__(self, obs_dim=OBS_DIM, dims=ACTION_DIMS):
@@ -212,7 +225,6 @@ class ActorCritic(nn.Module):
         self.move_head = nn.Linear(128, dims["move"])
         self.click_head = nn.Linear(128, dims["click"])
         self.block_head = nn.Linear(128, dims["block"])
-        self.jump_head = nn.Linear(128, dims["jump"])
         self.aim_mean = nn.Linear(128, dims["aim"])
         # State-independent log-std for the aim residual, started small (std~0.37 deg)
         # so early aim ~= the computed angle (the working floor) and RL explores gently
@@ -223,58 +235,63 @@ class ActorCritic(nn.Module):
         # and the aim residual is exactly 0 (aim == the computed geometry). Default
         # random init gave each head a constant state-dependent bias - e.g. a pinned
         # aim offset that read as "staring at the sky" on the first live run.
-        for head in (self.move_head, self.click_head, self.block_head,
-                     self.jump_head, self.aim_mean):
+        for head in (self.move_head, self.click_head, self.block_head, self.aim_mean):
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
-        # ...but bias the jump head toward NOT jumping (see JUMP_INIT_BIAS): a plain
-        # zero-init would jump 50% of ticks = constant hopping = permanently airborne.
-        self.jump_head.bias.data[1] = JUMP_INIT_BIAS
 
     def _heads(self, x):
         h = self.base(x)
         return (self.move_head(h), self.click_head(h), self.block_head(h),
-                self.jump_head(h), self.aim_mean(h), self.critic(h).squeeze(-1))
+                self.aim_mean(h), self.critic(h).squeeze(-1))
 
-    def _dists(self, move_l, click_l, block_l, jump_l, aim_m):
+    def _dists(self, move_l, click_l, block_l, aim_m):
         # Clamp: the entropy-ish pressure in PPO otherwise inflates aim std without
         # bound (measured drift 0.37deg -> 0.67deg over one night), which reads as
         # crosshair wobble/overshoot in game. 1 deg is plenty of exploration.
         std = torch.exp(self.aim_logstd.clamp(-2.5, 0.0))
         return (Categorical(logits=move_l), Categorical(logits=click_l),
-                Categorical(logits=block_l), Categorical(logits=jump_l),
-                Normal(aim_m, std))
+                Categorical(logits=block_l), Normal(aim_m, std))
 
     def act(self, obs_np, greedy=False):
         x = torch.as_tensor(obs_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
         with torch.no_grad():
-            move_l, click_l, block_l, jump_l, aim_m, value = self._heads(x)
-            md, cd, bd, jd, ad = self._dists(move_l, click_l, block_l, jump_l, aim_m)
+            move_l, click_l, block_l, aim_m, value = self._heads(x)
+            md, cd, bd, ad = self._dists(move_l, click_l, block_l, aim_m)
             if greedy:
-                move, click, block, jump = (move_l.argmax(-1), click_l.argmax(-1),
-                                            block_l.argmax(-1), jump_l.argmax(-1))
+                move, click, block = (move_l.argmax(-1), click_l.argmax(-1),
+                                      block_l.argmax(-1))
                 aim = aim_m
             else:
-                move, click, block, jump, aim = (md.sample(), cd.sample(), bd.sample(),
-                                                 jd.sample(), ad.sample())
+                move, click, block, aim = (md.sample(), cd.sample(), bd.sample(),
+                                           ad.sample())
             logp = (md.log_prob(move) + cd.log_prob(click) + bd.log_prob(block)
-                    + jd.log_prob(jump) + ad.log_prob(aim).sum(-1))
+                    + ad.log_prob(aim).sum(-1))
         action = {
             "move": int(move.item()), "click": int(click.item()),
-            "block": int(block.item()), "jump": int(jump.item()),
+            "block": int(block.item()),
             "aim": aim.squeeze(0).cpu().numpy().astype(np.float32),
         }
         return action, float(logp.item()), float(value.item())
 
-    def evaluate(self, obs, move_a, click_a, block_a, jump_a, aim_a):
-        move_l, click_l, block_l, jump_l, aim_m, values = self._heads(obs)
-        md, cd, bd, jd, ad = self._dists(move_l, click_l, block_l, jump_l, aim_m)
+    @torch.no_grad()
+    def head_entropies(self, obs):
+        """Mean per-head policy entropy (nats) over a batch of observations - the
+        direct 'is it still trying new things?' readout. Uniform-random ceilings:
+        move ln(9)~=2.20, click/block ln(2)~=0.69. A head sliding toward 0 has
+        stopped exploring; the CSV never recorded this, so exploration collapse was
+        only ever visible through its downstream symptoms (blk hitting 0%)."""
+        md, cd, bd, _ = self._dists(*self._heads(obs)[:4])
+        return tuple(float(d.entropy().mean()) for d in (md, cd, bd))
+
+    def evaluate(self, obs, move_a, click_a, block_a, aim_a):
+        move_l, click_l, block_l, aim_m, values = self._heads(obs)
+        md, cd, bd, ad = self._dists(move_l, click_l, block_l, aim_m)
         logp = (md.log_prob(move_a) + cd.log_prob(click_a) + bd.log_prob(block_a)
-                + jd.log_prob(jump_a) + ad.log_prob(aim_a).sum(-1))
+                + ad.log_prob(aim_a).sum(-1))
         # Entropy bonus on the CATEGORICAL heads only. A Gaussian's entropy is just
         # log-std, so including it pays the optimizer to make aim noisier forever;
         # the aim head gets its exploration from the (clamped) learned std instead.
-        entropy = md.entropy() + cd.entropy() + bd.entropy() + jd.entropy()
+        entropy = md.entropy() + cd.entropy() + bd.entropy()
         return logp, entropy, values
 
 
@@ -330,6 +347,13 @@ class ScriptedOpponent:
         self.tick = 0
         self.starved = 0   # turtle: consecutive band ticks with the target out of reach
         self.reclose = 0   # turtle: sprint-burst ticks left (block down to re-close)
+        # boxer state (see the boxer branch)
+        self.prev_my_h = None                      # own-health tracker (block-hit trigger)
+        self.block_hold = 0                        # ticks of block-hit left
+        self.rush = 0                              # aggression-burst ticks left
+        self.next_rush = random.randint(60, 120)   # ticks until the next burst
+        self.strafe_dir = random.choice((1, 2))    # sprint circle-left / circle-right
+        self.strafe_left = random.randint(8, 20)   # ticks until the direction flips
 
     def act(self, obs_np, greedy=False):
         s = self.env.last_state or {}
@@ -379,6 +403,48 @@ class ScriptedOpponent:
             # Swing through the approach (same idea as combat.py's SWING_RANGE): a
             # whiff costs a rusher nothing and connects the instant reach is entered.
             click = int(swing and 0.0 < d <= 4.5)
+        elif self.style == "boxer":
+            # The closest scripted approximation of a competent human, added when the
+            # first three styles were fully farmed (wr_script ~86%, half of updates at
+            # 100% = no gradient left in the scripted rounds). What it layers together:
+            # circle-strafe at reach with RANDOM direction flips (the kiter's fixed
+            # (tick//8) weave phase is memorizable; a random timer is not), W-tap after
+            # landing a hit, a short block-hit after TAKING one (proactive, through the
+            # follow-up window), s-taps when crowded, and irregular sprint-in bursts so
+            # its spacing rhythm can't be locked onto. Never jumps: staying grounded is
+            # also what punishes a hop-spamming learner (airborne targets take full
+            # knockback and lose sprint).
+            my_h = s.get("my_health")
+            took_hit = (my_h is not None and self.prev_my_h is not None
+                        and my_h < self.prev_my_h)
+            if my_h is not None:
+                self.prev_my_h = my_h
+            self.strafe_left -= 1
+            if self.strafe_left <= 0:
+                self.strafe_dir = 1 if self.strafe_dir == 2 else 2
+                self.strafe_left = random.randint(8, 20)
+            self.next_rush -= 1
+            if self.next_rush <= 0 and self.rush <= 0:
+                self.rush, self.next_rush = 12, random.randint(60, 120)
+            if tgt_hurt > self.prev_tgt_hurt:
+                self.wtap = 2                    # sprint-reset the hit just landed
+            if took_hit and self.rush <= 0:
+                self.block_hold = 6              # block-hit their follow-up window
+            if self.wtap > 0:
+                move = 3                         # W-tap: drop sprint, keep walking in
+            elif self.rush > 0:
+                move = 0                         # aggression burst: sprint straight in
+            elif d > 3.6 or d <= 0.0:
+                move = 0                         # off the spacing line: close it
+            elif d < 2.2 and (self.tick % 30) < 5:
+                move = 8                         # crowded: s-tap back out to reach
+            else:
+                move = self.strafe_dir           # circle at reach
+            block = int(self.block_hold > 0 and 0.0 < d <= 4.0)
+            click = int(swing and 0.0 < d <= (4.5 if self.rush > 0 else 3.6))
+            self.wtap = max(0, self.wtap - 1)
+            self.rush = max(0, self.rush - 1)
+            self.block_hold = max(0, self.block_hold - 1)
         else:  # kiter
             if 0.0 < d < 2.6:
                 move = 8                                # s-tap: kill closing momentum
@@ -414,6 +480,10 @@ class SelfPlayHarness:
         # Learner env issues the teleport/heal for BOTH fighters; opp just re-syncs.
         obs = self.learner.reset()
         self.opp_obs = self.opp.reset()
+        # Did a HUMAN take over the opponent client this round (pressed P)? Detected
+        # per tick in step() from the opp's ai_active telemetry; when true the round
+        # is retagged "human" so it never pollutes a scripted style's winrate.
+        self.opp_human = False
         # Cross-wire the simulated lags so each fighter's tgt_ping reports the
         # OTHER's delay (a round late on the reset frames themselves; those are
         # idle-teleport frames, so nothing meaningful reads it early).
@@ -446,8 +516,13 @@ class SelfPlayHarness:
         if self.opp_policy is not None:
             opp_action, _, _ = self.opp_policy.act(self.opp_obs)
         else:
-            opp_action = {"move": 0, "click": 0, "block": 0, "jump": 0,
+            opp_action = {"move": 0, "click": 0, "block": 0,
                           "aim": np.zeros(ACTION_DIMS["aim"], dtype=np.float32)}
+        # A human-controlled opponent (P pressed) reports ai_active=false; the actions
+        # we send it are ignored, so this round isn't really the tagged sparring style.
+        # Absent key (old jar) defaults True, so nothing changes until the jar is rebuilt.
+        if not (self.opp.last_state or {}).get("ai_active", True):
+            self.opp_human = True
         # Dispatch BOTH fighters' actions before blocking on either recv, so they
         # share the same control latency. Sending+recving the opponent fully before
         # even sending the learner's action gave the learner an extra tick of loop
@@ -531,7 +606,6 @@ def ppo_update(model, optimizer, batch):
     move_a = torch.as_tensor(batch["move"], dtype=torch.long, device=DEVICE)
     click_a = torch.as_tensor(batch["click"], dtype=torch.long, device=DEVICE)
     block_a = torch.as_tensor(batch["block"], dtype=torch.long, device=DEVICE)
-    jump_a = torch.as_tensor(batch["jump"], dtype=torch.long, device=DEVICE)
     aim_a = torch.as_tensor(np.array(batch["aim"]), dtype=torch.float32, device=DEVICE)
     old_logp = torch.as_tensor(batch["logprobs"], dtype=torch.float32, device=DEVICE)
     adv = torch.as_tensor(batch["adv"], dtype=torch.float32, device=DEVICE)
@@ -545,7 +619,7 @@ def ppo_update(model, optimizer, batch):
         for start in range(0, n, MINIBATCH):
             mb = idx[start:start + MINIBATCH]
             logp, entropy, values = model.evaluate(
-                obs[mb], move_a[mb], click_a[mb], block_a[mb], jump_a[mb], aim_a[mb])
+                obs[mb], move_a[mb], click_a[mb], block_a[mb], aim_a[mb])
             ratio = torch.exp(logp - old_logp[mb])
             s1 = ratio * adv[mb]
             s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[mb]
@@ -564,7 +638,7 @@ def collect_rollout(harness, model, n_steps, state):
     """Run the env for n_steps, returning a flat batch. `state` carries obs across
     rollout boundaries so episodes aren't cut artificially."""
     obs_buf, logp_buf, rew_buf, done_buf, val_buf = [], [], [], [], []
-    move_buf, click_buf, block_buf, jump_buf, aim_buf = [], [], [], [], []
+    move_buf, click_buf, block_buf, aim_buf = [], [], [], []
     obs = state["obs"]
     ep_reward, ep_results = state.get("ep_reward", 0.0), []
     total_dealt = total_taken = 0.0
@@ -572,6 +646,7 @@ def collect_rollout(harness, model, n_steps, state):
     stale_vals = []     # mod-reported control-loop lag (healthy 1, spin-phase 2)
     whiffs = click_evals = 0   # in-range clicks whose crosshair ray missed / total
     yaw_errs = []       # signed combat-range yaw error; mean < 0 = crosshair sits right
+    jump_ticks = 0      # ticks the SCRIPTED crit-jump reflex fired (info["jumped"])
 
     for _ in range(n_steps):
         action, logp, value = model.act(obs)
@@ -588,10 +663,12 @@ def collect_rollout(harness, model, n_steps, state):
             whiffs += 1 if info.get("whiff") else 0
         if info.get("yaw_err") is not None:
             yaw_errs.append(info["yaw_err"])
+        if info.get("jumped"):
+            jump_ticks += 1
 
         obs_buf.append(obs)
         move_buf.append(action["move"]); click_buf.append(action["click"])
-        block_buf.append(action["block"]); jump_buf.append(action["jump"])
+        block_buf.append(action["block"])
         aim_buf.append(action["aim"])
         logp_buf.append(logp)
         rew_buf.append(reward); done_buf.append(float(done)); val_buf.append(value)
@@ -600,8 +677,11 @@ def collect_rollout(harness, model, n_steps, state):
         if done:
             # Tag the result with which snapshot we were fighting, so the log can
             # show winrate vs old selves separately from winrate vs recent selves.
-            ep_results.append((info.get("result", "?"), ep_reward,
-                               getattr(harness, "opp_tag", "?"),
+            # A round a human hijacked (P on the opponent) is tagged "human" so it
+            # can't be attributed to the scripted style that was NOMINALLY scheduled.
+            tag = ("human" if getattr(harness, "opp_human", False)
+                   else getattr(harness, "opp_tag", "?"))
+            ep_results.append((info.get("result", "?"), ep_reward, tag,
                                getattr(harness, "pinned", False)))
             ep_reward = 0.0
             # New round: resample opponent from the pool happens in the caller
@@ -619,7 +699,7 @@ def collect_rollout(harness, model, n_steps, state):
         last_value)
     return {
         "obs": obs_buf, "move": move_buf, "click": click_buf, "block": block_buf,
-        "jump": jump_buf, "aim": aim_buf, "logprobs": logp_buf,
+        "aim": aim_buf, "logprobs": logp_buf,
         "adv": adv, "returns": returns,
     }, ep_results, {
         "dealt": total_dealt, "taken": total_taken,
@@ -629,6 +709,9 @@ def collect_rollout(harness, model, n_steps, state):
         "staleness": float(np.mean(stale_vals)) if stale_vals else float("nan"),
         "whiff": whiffs / max(click_evals, 1),
         "aim_bias": float(np.mean(yaw_errs)) if yaw_errs else float("nan"),
+        # Fraction of rollout ticks the scripted crit-jump fired (was the learned
+        # 'jmp' head rate; kept under the same CSV column so plot_progress still works).
+        "jump_rate": jump_ticks / max(n_steps, 1),
     }
 
 
@@ -647,19 +730,34 @@ def main():
     warm_start_from_bc(model)
 
     def load_adapted(path):
-        """Load a self-play checkpoint, remapping older layouts (frame dim, move
-        dim, jump head) onto the current architecture."""
-        return adapt_ckpt_add_jump_head(adapt_ckpt_move_dim(
+        """Load a self-play checkpoint, remapping older layouts (frame dim, move dim)
+        onto the current architecture and DROPPING any jump_head.* keys - the jump head
+        was removed when crit-jump became a scripted reflex, so every checkpoint on disk
+        (BC clone, best, latest, pool snapshots) still carries it. The remaining keys
+        (base + move/click/block/aim/critic) match the current jumpless model exactly."""
+        sd = adapt_ckpt_move_dim(
             adapt_ckpt_frame_dim(torch.load(path, map_location=DEVICE)),
-            ACTION_DIMS["move"]), model)
+            ACTION_DIMS["move"])
+        return {k: v for k, v in sd.items() if not k.startswith("jump_head")}
 
-    # Resume from the last self-play checkpoint if there is one, so restarting the
-    # trainer (reward tweaks, crashes) continues the run instead of starting over.
+    # Startup priority: resume a live run > start from the cloned policy > fall back to
+    # the trunk-only BC floor. Resuming keeps a run going across reward tweaks and
+    # crashes. Absent that, pvp_selfplay_bc.pth (train_bc.py) is a policy whose
+    # move/click/block heads are cloned from human play, so PPO fine-tunes a bot that
+    # already blocks like a person - instead of exploring up from random heads into the
+    # no-block corner. (Jump is scripted, not cloned; a pre-removal bc.pth still loads -
+    # load_adapted drops its jump_head.) warm_start_from_bc above already seeded the
+    # trunk, so if neither checkpoint exists we still start there.
     try:
         model.load_state_dict(load_adapted("pvp_selfplay_latest.pth"))
         print("Resumed from pvp_selfplay_latest.pth")
     except FileNotFoundError:
-        print("No self-play checkpoint - starting from the BC warm start.")
+        try:
+            model.load_state_dict(load_adapted("pvp_selfplay_bc.pth"))
+            print("Started from pvp_selfplay_bc.pth (all decision heads cloned from "
+                  "human play).")
+        except FileNotFoundError:
+            print("No self-play/BC checkpoint - starting from the trunk-only BC warm start.")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
     # Opponent pool: (tag, weights) so results can be split by snapshot age.
@@ -668,11 +766,30 @@ def main():
     # strongest partner on disk (it also can't be weaker than start by much, so
     # it never dilutes the pool the way an arbitrary old checkpoint could).
     pool = [("start", copy.deepcopy(model.state_dict()))]
+    # Also seed a spread of DISK snapshots (oldest / middle / newest). Restarts are
+    # frequent in practice (14 in the metrics file), and each one used to reset the
+    # pool to start+best - both ~= the resume point, so the learner overfit to
+    # sparring near-copies of itself within hours. Old snapshots put yesterday's
+    # styles back in the mix. Inserted oldest-first, BEFORE best, so the pool's
+    # oldest->newest ordering (which the wr_old/wr_new split reads) stays honest.
+    snaps = sorted(glob.glob(os.path.join("pool_snapshots", "*.pth")),
+                   key=os.path.getmtime)
+    for i in (sorted({0, len(snaps) // 2, len(snaps) - 1}) if snaps else []):
+        try:
+            pool.append((os.path.splitext(os.path.basename(snaps[i]))[0],
+                         load_adapted(snaps[i])))
+            print(f"Seeded pool with {snaps[i]}")
+        except Exception as e:
+            print(f"Could not seed {snaps[i]}: {e}")
     try:
         pool.append(("best", load_adapted("pvp_selfplay_best.pth")))
         print("Seeded pool with pvp_selfplay_best.pth")
     except FileNotFoundError:
         pass
+    except Exception as e:
+        # A stale-architecture best.pth (e.g. pre-jump-head-removal that somehow
+        # doesn't remap) must not crash startup - skip it like the snapshot loop does.
+        print(f"Could not seed pvp_selfplay_best.pth: {e}")
     opponent = ActorCritic().to(DEVICE)
 
     def set_opponent_from(entry):
@@ -755,13 +872,31 @@ def main():
             # the ground truth under winrate (which timeouts drag below 50%).
             blk = float(np.mean(batch["block"]))
             clk = float(np.mean(batch["click"]))
-            jmp = float(np.mean(batch["jump"]))   # fraction of ticks the policy jumps
+            jmp = dmg["jump_rate"]   # ticks the SCRIPTED crit-jump reflex fired (jump
+                                     # is no longer a learned head - kept as 'jmp' so
+                                     # the CSV/plot columns stay put)
+            # Exploration / aim-head introspection (see METRICS_HEADER comment). The
+            # jump head is gone; ent_jump stays in the CSV as a dead 0.0 column so the
+            # header and plot_progress.py don't need touching.
+            ent_move, ent_click, ent_block = model.head_entropies(
+                torch.as_tensor(np.array(batch["obs"]), dtype=torch.float32,
+                                device=DEVICE))
+            ent_jump = 0.0
+            aim_std = float(torch.exp(model.aim_logstd.detach().clamp(-2.5, 0.0)).mean())
+            res = np.array(batch["aim"], dtype=np.float32)
+            res_yaw, res_pitch = float(res[:, 0].mean()), float(res[:, 1].mean())
+            mv_counts = np.bincount(batch["move"], minlength=ACTION_DIMS["move"])
+            move_top = int(mv_counts.argmax())
+            move_top_frac = float(mv_counts.max() / max(mv_counts.sum(), 1))
+            per_style = {st: wr_num([r for r, _, t, _ in results if t == st])
+                         for st in SCRIPTED_STYLES}
             print(f"upd {update:4d} | rounds {len(results):3d} ({timeouts} tmo) | "
                   f"winrate {wins/len(results):4.0%} (old {wr(old_res)} new {wr(new_res)} "
                   f"scr {wr(scr_res)} pin {wr(pin_res)}) | "
                   f"dmg +{dmg['dealt']:3.0f}/-{dmg['taken']:3.0f} | "
                   f"blk {blk:4.0%} clk {clk:4.0%} jmp {jmp:4.0%} | "
-                  f"whiff {dmg['whiff']:4.0%} bias {dmg['aim_bias']:+5.1f} | "
+                  f"whiff {dmg['whiff']:4.0%} bias {dmg['aim_bias']:+5.1f} "
+                  f"res {res_yaw:+4.1f} | ent {ent_move:.2f} | "
                   f"avg reward {avg_r:+6.2f} | ploss {p_loss:+.3f} vloss {v_loss:.3f} | "
                   f"lat {dmg['staleness']:.2f}")
             # Per-opponent W-L (kills-deaths from the LEARNER's side), so a single
@@ -785,6 +920,12 @@ def main():
                 "whiff": dmg["whiff"], "aim_bias": dmg["aim_bias"],
                 "avg_reward": avg_r,
                 "ploss": p_loss, "vloss": v_loss, "staleness": dmg["staleness"],
+                "wr_turtle": per_style["turtle"], "wr_rusher": per_style["rusher"],
+                "wr_kiter": per_style["kiter"], "wr_boxer": per_style["boxer"],
+                "ent_move": ent_move, "ent_click": ent_click,
+                "ent_block": ent_block, "ent_jump": ent_jump,
+                "aim_std": aim_std, "res_yaw": res_yaw, "res_pitch": res_pitch,
+                "move_top": move_top, "move_top_frac": move_top_frac,
             })
             recent_avg.append(avg_r)
             # Divergence firewall. With the reward now bounded (pvp_env REWARD_CLIP) a

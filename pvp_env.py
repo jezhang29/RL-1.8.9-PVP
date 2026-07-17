@@ -1,15 +1,16 @@
 """Reinforcement-learning environment for one PvP fighter.
 
 The mod connects in as a socket client (same protocol as ai_server); this class is
-the server side. Each tick the RL policy chooses a COMPOSITE action:
-  - a movement primitive (spacing / knockback management, incl. W-tap by choosing a
-    no-sprint primitive after a hit),
+the server side. Each tick the RL policy chooses a COMPOSITE action - only the
+situational judgment, the part a learned policy can beat hardcoded rules at:
+  - a movement primitive (spacing / engage / disengage / strafe / s-tap),
   - whether to swing (attack),
-  - whether to sword-block (blockhit),
+  - whether to hold a defensive sword-block posture,
   - a small aim residual on top of the computed angle.
-Only the base aim geometry and the periodic crit-jump stay computed (CombatController.
-act_policy). So the agent learns spacing AND its own attack/block/W-tap timing and can
-refine aim - the parts where a learned policy can beat hardcoded rules.
+The mechanical, event-timed techniques stay COMPUTED (CombatController.act_policy),
+because their correct timing is a known function of an event, not something worth
+learning from sparse reward at 20 Hz: the base aim geometry, the post-hit blockhit
+sprint-reset, and the crit-jump (fired only in the victim's falling i-frame window).
 
 Self-play = two of these on two ports, stepped in lockstep by the trainer. Kept to a
 single fighter here so it stays composable.
@@ -53,17 +54,16 @@ ACTIONS = [
 N_ACTIONS = len(ACTIONS)
 
 # Composite action space the policy chooses from each tick:
-#   move  : Discrete(N_ACTIONS)     - which movement primitive
+#   move  : Discrete(N_ACTIONS)     - which movement primitive (the situational read)
 #   click : Discrete(2)             - swing or not (tick rate is the only CPS cap)
-#   block : Discrete(2)             - hold sword-block or not
-#   jump  : Discrete(2)             - jump this tick (crit-jump timing, LEARNED - was a
-#                                     hardcoded post-hit rule; the policy now decides
-#                                     when a crit is worth the airborne-knockback risk)
+#   block : Discrete(2)             - hold a defensive sword-block posture or not
 #   aim   : Box(2)                  - yaw/pitch residual (deg), clamped to +-AIM_RES_MAX
+# Jump is NOT here: crit-jump is a scripted reflex (combat.act_policy / _crit_jump), and
+# the post-hit blockhit sprint-reset is scripted too - the mechanical, event-timed
+# techniques whose correct timing is known, so the policy only owns the situational parts.
 MOVE_DIM = N_ACTIONS
 CLICK_DIM = 2
 BLOCK_DIM = 2
-JUMP_DIM = 2
 AIM_DIM = 2
 
 KILL_REWARD = 10.0
@@ -132,10 +132,18 @@ SIM_LAG_MS_PER_TICK = 50
 # just log-std) and nothing else anchors it to 0, so it random-walks into one-sided,
 # state-dependent offsets that fight the computed geometry - the crosshair orbits and
 # the intermittent "spin". Tax the squared residual so a lead only survives if it's
-# earning hits: at 0.002 a ~1deg correction is ~free (0.002/tick), a 3deg lead is cheap
-# (0.036/tick), and pinning the full +-8deg is expensive (0.256/tick, ~a hit over 20
-# ticks) - exactly the ordering we want.
-AIM_RES_COEF = 0.004
+# earning hits.
+# Jul 17 retune (0.004 -> 0.002, WHIFF 0.05 -> 0.10): 250+ updates of data showed
+# whiff flat at ~33% and aim_bias parked at -1.5deg while the residual stayed ~0.
+# The economics were inverted: a useful ~3deg lead cost 0.036/tick under the old tax,
+# while eating the whiffs it would prevent cost only ~0.013/tick (0.05 x ~0.76 click
+# rate x ~0.33 whiff) - so "no lead, accept the misses" was the cheaper corner, a
+# priced-in local optimum. Now a 3deg lead is 0.018/tick vs ~0.025/tick of expected
+# whiff penalty: correcting aim pays. Both terms stay bounded (residual is clamped to
+# +-AIM_RES_MAX before squaring, so the tax maxes at 0.064/tick; REWARD_CLIP and the
+# trainer's v_loss firewall backstop the rest) - this is NOT the unbounded tax that
+# caused the detonation.
+AIM_RES_COEF = 0.002
 # Whiff penalty: 1.8 hit registration is a client-side ray from the eye through the
 # crosshair against the target's AABB (reach ~3). The mod reports whether that ray
 # connects THIS tick as my_ray_hit. Swinging inside reach while the ray MISSES is a
@@ -145,9 +153,15 @@ AIM_RES_COEF = 0.004
 # Only applied when the mod actually reports my_ray_hit (new jar); absent -> skipped,
 # so an old jar never eats a blanket swing penalty. Small, so it shapes aim without
 # ever discouraging swinging itself (a connecting swing is worth ~6 health).
-WHIFF_PENALTY = 0.05
+WHIFF_PENALTY = 0.10
 WHIFF_RANGE = 3.0     # blocks; matches the mod's 3.0 ray reach - past this a dead-on
                       # ray legitimately falls short, so no penalty out there
+# NOTE: jump used to be a learned policy head and ran away to ~35% of ticks (constant
+# bunny-hopping = permanently airborne = full knockback taken, the "how is this so bad"
+# fight). It cost an AIRBORNE_HIT_PENALTY + JUMP_TAX pair of shaping band-aids. The
+# Jul 17 re-hybridization removed the head entirely: crit-jump is now a scripted reflex
+# (combat.act_policy / _crit_jump) that only fires in the victim's i-frame window, so
+# there is nothing to tax and those two constants are gone.
 
 
 class PvPEnv:
@@ -298,8 +312,11 @@ class PvPEnv:
         mod_action = self.combat.act_policy(
             self.last_state, movement,
             click=bool(action["click"]), block=bool(action["block"]),
-            aim_res=action["aim"], jump=bool(action.get("jump", False)),
+            aim_res=action["aim"],
             latch_block=bool(action.get("latch_block", True)))
+        # Jump is now a SCRIPTED crit reflex inside act_policy (not a policy head).
+        # Surface whether it fired this tick so the rollout can log a crit-jump rate.
+        self._scripted_jump = bool(mod_action.get("jump"))
         # Simulated latency: hold the BODY inputs (move/click/block/jump) sim_lag
         # ticks before they reach the mod - that models the ping-delayed control
         # loop and gives the ping features signal. But the AIM (yaw/pitch) is NOT
@@ -370,6 +387,12 @@ class PvPEnv:
         if whiffed:
             reward -= WHIFF_PENALTY
 
+        # (The old JUMP_TAX / AIRBORNE_HIT_PENALTY shaping is gone: jump is no longer a
+        # policy head but a scripted crit reflex that only fires inside the victim's
+        # i-frame window, when the opponent can't hit back - so there is no runaway hop
+        # rate to tax, and taxing an involuntary knockback-airborne frame the policy
+        # can't avoid only added noise. See combat.act_policy / _crit_jump.)
+
         # First blood, once per round, signed
         if not self.first_hit_done and (dealt > 0.0 or taken > 0.0):
             self.first_hit_done = True
@@ -413,7 +436,10 @@ class PvPEnv:
                 # Aim-quality telemetry: whiff = in-range click whose crosshair ray
                 # missed; click_eval = the denominator (in-range clicks with the new
                 # jar's ray key present). Rollout aggregates these into a whiff rate.
-                "whiff": whiffed, "click_eval": click_eval}
+                "whiff": whiffed, "click_eval": click_eval,
+                # Whether the scripted crit-jump reflex fired this tick (jump is no
+                # longer a policy head); the rollout aggregates it into a crit rate.
+                "jumped": getattr(self, "_scripted_jump", False)}
         # Signed geometric yaw error (no lead, no residual) at combat range, for the
         # aim-bias metric. Positive = the target sits RIGHT of the crosshair (we still
         # need to turn right); NEGATIVE = the crosshair sits right of the target - a
@@ -455,6 +481,7 @@ class PvPEnv:
 # Observation/action dims for the trainer to import
 OBS_DIM = INPUT_DIM
 ACT_DIM = N_ACTIONS          # kept for back-compat; = MOVE_DIM
-# Composite heads: (move, click, block, jump, aim); AIM_RES_MAX bounds the aim residual.
+# Composite heads: (move, click, block, aim); AIM_RES_MAX bounds the aim residual.
+# Jump is scripted (see above), so there is no jump head.
 ACTION_DIMS = {"move": MOVE_DIM, "click": CLICK_DIM, "block": BLOCK_DIM,
-               "jump": JUMP_DIM, "aim": AIM_DIM}
+               "aim": AIM_DIM}

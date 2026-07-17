@@ -157,8 +157,15 @@ public class MLMod {
                     lastActionMillis = System.currentTimeMillis();
                     currentAction = newAction;
                 }
+                // readLine() == null: Python closed the socket CLEANLY (normal
+                // trainer shutdown/restart). Fall through to the retry below -
+                // this path used to skip the catch block entirely, leaving
+                // out/isConnecting set, so a clean restart of the trainer meant
+                // relaunching the whole client to ever reconnect.
             } catch (Exception e) {
-                System.err.println("[Telemetry] Connection lost. Retrying...");
+                // Hard drop (trainer crash, parse error) - same recovery.
+            } finally {
+                System.err.println("[Telemetry] Connection lost. Retrying in 5s...");
                 out = null;
                 in = null;
                 isConnecting = false;
@@ -303,6 +310,10 @@ public class MLMod {
             // Session bookkeeping - lets Python detect gaps when stacking frames
             json.addProperty("tick", thisTick);
             json.addProperty("recording", isRecording);
+            // Whether the bot is driving this client (P toggles it). When false a HUMAN
+            // took over, so the self-play trainer must not attribute this round to the
+            // scripted style it scheduled (the actions it sends are being ignored).
+            json.addProperty("ai_active", isAiActive);
             // Last measured control-loop lag (ticks); healthy 1, phase-locked 2,
             // -1 until Python starts echoing ack_tick. Lets the trainer log it.
             json.addProperty("staleness", lastStaleness);

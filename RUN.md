@@ -4,10 +4,14 @@ Two brains share one mod + one combat module ([combat.py](combat.py)):
 
 - **BC bot** (`ai_server.py`): learned **movement**; aim + attack + W-tap + blockhit are
   computed rules (`combat.act`). This is the imitation-trained baseline.
-- **Self-play bot** (`train_selfplay.py` → `ai_server.py selfplay`): learned **movement,
-  attack, block and W-tap**, plus a learned **aim residual** on top of the computed angle
-  (`combat.act_policy`). Only the base aim geometry and the periodic crit-jump stay
-  computed. This is the one that can *surpass* the hardcoded timings.
+- **Self-play bot** (`train_selfplay.py` → `ai_server.py selfplay`): learns the
+  **situational judgment** — **movement** (engage/disengage/strafe/s-tap), **attack**,
+  a **defensive-block posture**, and an **aim residual** on top of the computed angle
+  (`combat.act_policy`). The mechanical, event-timed techniques stay **computed**, like
+  aim, because their correct timing is a known function of an event: the base aim
+  geometry, the **post-hit blockhit sprint-reset**, and the **crit-jump** (fired only in
+  the victim's falling i-frame window). This is the one that can *surpass* hardcoded
+  timings on the parts a policy can actually beat rules at.
 
 **In-game keys:** `P` toggles the AI on/off · `O` toggles data recording.
 
@@ -41,19 +45,41 @@ Launch Minecraft, join a world, press **P**. Beyond 16 blocks it idles by design
 
 ---
 
-## 2. Record more data / retrain the BC model (optional)
+## 2. Record play and clone it into the policy (imitation-first)
+
+At 20 steps/sec real time, self-play exploration is sample-starved and keeps settling
+into degenerate corners (constant hopping, zero blocking). The highest-leverage fix is
+to **clone good human play** into the policy first, then let RL fine-tune it. One minute
+of you playing well is worth thousands of random exploration steps.
 
 ```bash
 python server.py             # writes pvp_dataset_v3.csv while you play
 ```
 
-Press **O** in-game to start/stop recording. Play normally — include close combat,
-full combos, getting comboed and escaping, W-taps, strafing, chases from 10-16 blocks.
-Then:
+Press **O** in-game to start/stop recording. Play **good** PvP — this is the ceiling on
+what the clone can learn, so demonstrate the **situational judgment** you want: spacing,
+when to commit vs disengage, **defensive blocking** to trade against a cornered opponent,
+strafe, escape when low. Include chases from 10-16 blocks. You do **not** need to nail the
+mechanical timings — the post-hit blockhit sprint-reset, W-tap and crit-jump are scripted
+reflexes now, computed from the hit event, so the clone only needs your *decisions*. To
+fight the AI on 9998 and record yourself on 9999, or vice-versa, use **P** to disable AI
+on whichever client you're playing. Then:
 
 ```bash
-python train_model.py        # trains on the newest CSV -> pvp_model_v2.pth
+python train_bc.py           # clones move/click/block from your play
+                             #   -> pvp_selfplay_bc.pth  (a self-play starting policy)
 ```
+
+It prints your actual move mix and click/block rates (if block reads ~0%, you didn't
+record enough blocking — record more, don't tune the trainer) and per-head val accuracy.
+`train_selfplay.py` then **starts from this policy** whenever there's no live run to
+resume (see §3). Aim and jump are not cloned — aim stays the computed geometry floor, and
+crit-jump is a scripted reflex.
+
+> **Legacy path:** `python train_model.py` still trains the old movement-only
+> `pvp_model_v2.pth`, which warm-starts only the self-play *trunk*. `train_bc.py`
+> supersedes it (it clones the decision heads too); keep `pvp_model_v2.pth` around only
+> as the trunk fallback.
 
 ---
 
@@ -110,9 +136,13 @@ taken − a time penalty, plus style shaping that is small next to a ~6-damage h
 | Escalating bonus for hits ≤1.25 s apart | `COMBO_BONUS`, `COMBO_WINDOW` | hold combos |
 | Bonus ∝ target launch speed after our hit | `KB_COEF`, `KB_NORM` | sprint-reset (W-tap) |
 
-**Resuming:** the trainer auto-loads `pvp_selfplay_latest.pth` on startup, so you can
-stop it, tweak rewards, and continue without losing progress. Delete/rename that file
-to start fresh.
+**Startup priority:** the trainer loads, in order, (1) `pvp_selfplay_latest.pth` to
+resume a live run, else (2) `pvp_selfplay_bc.pth` — the imitation-cloned policy from §2,
+so RL fine-tunes a bot that already blocks like a human — else (3) the trunk-only BC
+floor. So to start a **fresh run from your cloned play**, delete/rename
+`pvp_selfplay_latest.pth` and it picks up `pvp_selfplay_bc.pth`. Stopping and restarting
+mid-run always resumes from `latest`. Old checkpoints from before the jump head was
+removed still load — `load_adapted` drops their `jump_head` weights automatically.
 
 **What to expect early:** the first hour is supposed to look stupid — near-uniform
 random movement, ~50% click spam, ~50% block spam. Aim starts ≈ the computed angle
@@ -151,15 +181,19 @@ are the policy's, not the rules'.
 |---|---|---|
 | `AIM_GAIN` | 0.6 | Fraction of the *computed* aim error closed per tick (the learned residual rides on top) |
 | `AIM_LEAD_TICKS` | 2.0 | Aim at where both fighters **will** be, cancelling the mod→Python→mod latency (fixes trailing/overshooting a strafing or jumping target; `tgt_vy` telemetry needs the jar from Jul 15+) |
-| `AIM_RES_MAX` | 8.0 | Max magnitude (deg) of the learned aim residual — how far RL may bend the crosshair off the geometry |
-| `BLOCK_MIN_TICKS` | 3 | Min block hold once the policy chooses it — server-side reduction never registers 1-tick blips |
-| `REACH` | 3.4 | Distance for crit-jump gating |
+| `AIM_RES_MAX` | 4.0 | Max magnitude (deg) of the learned aim residual — how far RL may bend the crosshair off the geometry |
+| `BLOCK_MIN_TICKS` | 3 | Min hold once the policy chooses a **defensive** block — server-side reduction never registers 1-tick blips |
+| `BLOCK_TICKS` | 3 | Length of the **scripted post-hit blockhit** pulse (sprint-reset) fired the tick the learner lands a hit |
+| `CRIT_HURT_LO/HI` | 5 / 8 | Target hurtTime window the **scripted crit-jump** fires in (learner only) |
+| `CRIT_RANGE` | 4.5 | Max distance to still chase a crit down |
 | `CRIT_GAP` | 12 | Ticks between crit jumps |
 
-In self-play, **click cadence, block timing and W-tap are learned**, so `CPS_FAST_PROB`,
-`WTAP_TICKS`, `BLOCK_TICKS`, `SWING_*` do **not** apply — the per-tick rate (≤20 CPS) is
-the only cap. Early in training aim ≈ the computed angle (residual starts near 0) and
-clicking is ~random; both sharpen as reward accrues.
+In self-play the policy owns **click cadence** and the **defensive-block posture**, so
+`CPS_FAST_PROB` and `SWING_*` don't apply — the per-tick rate (≤20 CPS) is the only cap.
+But the **post-hit blockhit sprint-reset and crit-jump are scripted reflexes** now (the
+Jul 17 re-hybridization), so `BLOCK_TICKS` and the `CRIT_*` constants above DO apply to
+the learner, and there is no learned jump head. Early in training aim ≈ the computed
+angle (residual starts near 0) and clicking is ~random; both sharpen as reward accrues.
 
 **BC bot only (`act`, the rule combat):**
 

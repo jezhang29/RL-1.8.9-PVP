@@ -62,7 +62,49 @@ HTML = """<!doctype html>
 <div class="grid" id="grid"></div>
 <script>
 const DATA = __DATA__;
-const X = DATA.map(d => d.update);
+// The trainer logs one row per opponent/rollout, so `update` repeats many times.
+// Collapse to a single point per update before plotting, otherwise the x-axis is
+// non-monotonic and every series zig-zags back and forth into an illegible mess.
+function aggregate(rows) {
+  const byU = new Map();
+  for (const r of rows) {
+    if (!byU.has(r.update)) byU.set(r.update, []);
+    byU.get(r.update).push(r);
+  }
+  const SUM = new Set(['dealt', 'taken', 'hits', 'timeouts', 'rounds']);
+  const out = [];
+  for (const u of [...byU.keys()].sort((a, b) => a - b)) {
+    const grp = byU.get(u);
+    const rec = { update: u };
+    const keys = new Set();
+    for (const r of grp) for (const k of Object.keys(r)) keys.add(k);
+    for (const k of keys) {
+      if (k === 'update') continue;
+      if (k === 'max_combo') {
+        let m = null;
+        for (const r of grp) if (r[k] != null) m = m == null ? r[k] : Math.max(m, r[k]);
+        rec[k] = m;
+      } else if (SUM.has(k)) {
+        let s = 0, any = false;
+        for (const r of grp) if (r[k] != null) { s += r[k]; any = true; }
+        rec[k] = any ? s : null;
+      } else {
+        // rounds-weighted mean over non-null values
+        let s = 0, w = 0;
+        for (const r of grp) {
+          if (r[k] == null) continue;
+          const wt = r.rounds != null && r.rounds > 0 ? r.rounds : 1;
+          s += r[k] * wt; w += wt;
+        }
+        rec[k] = w ? s / w : null;
+      }
+    }
+    out.push(rec);
+  }
+  return out;
+}
+const ROWS = aggregate(DATA);
+const X = ROWS.map(d => d.update);
 
 function rollmean(ys, w) {
   const out = ys.map((_, i) => {
@@ -79,30 +121,37 @@ function chart(el, title, note, series, opts) {
   opts = opts || {};
   const W = 440, H = 200, PADL = 44, PADR = 12, PADT = 10, PADB = 22;
   const win = +document.getElementById('win').value;
-  // autoscale over all (smoothed) series
+  // optional log-y transform, for series with huge dynamic range (e.g. value loss)
+  const T = opts.log ? (v => Math.log10(Math.max(v, 1e-9))) : (v => v);
+  const Tinv = opts.log ? (t => Math.pow(10, t)) : (t => t);
+  // autoscale over all (smoothed) series, in transformed space
   let lo = Infinity, hi = -Infinity;
   const smoothed = series.map(s => {
-    const raw = DATA.map(s.f);
+    const raw = ROWS.map(s.f);
     const sm = rollmean(raw, win);
-    for (const v of sm) if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+    for (const v of sm) if (v != null) { const t = T(v); lo = Math.min(lo, t); hi = Math.max(hi, t); }
     return { ...s, raw, sm };
   });
-  if (opts.y0 != null) lo = Math.min(lo, opts.y0);
-  if (opts.y1 != null) hi = Math.max(hi, opts.y1);
+  if (opts.y0 != null) lo = Math.min(lo, T(opts.y0));
+  if (opts.y1 != null) hi = Math.max(hi, T(opts.y1));
   if (!isFinite(lo)) { lo = 0; hi = 1; }
   if (lo === hi) { hi = lo + 1; }
   const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
   const xmin = X[0], xmax = X[X.length - 1] || 1;
   const sx = u => PADL + (W - PADL - PADR) * ((u - xmin) / Math.max(1, xmax - xmin));
-  const sy = v => PADT + (H - PADT - PADB) * (1 - (v - lo) / (hi - lo));
-  const fmt = opts.pct ? (v => (v * 100).toFixed(0) + '%') : (v => (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2)));
+  const syT = t => PADT + (H - PADT - PADB) * (1 - (t - lo) / (hi - lo));
+  const sy = v => syT(T(v));
+  const fmtNum = v => (Math.abs(v) >= 1e6 ? (v / 1e6).toFixed(1) + 'M'
+                     : Math.abs(v) >= 1e3 ? (v / 1e3).toFixed(1) + 'k'
+                     : Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2));
+  const fmt = opts.pct ? (v => (v * 100).toFixed(0) + '%') : fmtNum;
 
   let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">`;
   // gridlines + y labels
   for (let i = 0; i <= 4; i++) {
-    const v = lo + (hi - lo) * i / 4, y = sy(v);
+    const t = lo + (hi - lo) * i / 4, y = syT(t);
     svg += `<line x1="${PADL}" y1="${y}" x2="${W - PADR}" y2="${y}" stroke="currentColor" stroke-opacity=".08"/>`;
-    svg += `<text x="${PADL - 6}" y="${y + 3}" text-anchor="end" font-size="10" fill="currentColor" fill-opacity=".55">${fmt(v)}</text>`;
+    svg += `<text x="${PADL - 6}" y="${y + 3}" text-anchor="end" font-size="10" fill="currentColor" fill-opacity=".55">${fmt(Tinv(t))}</text>`;
   }
   if (opts.ref != null) {
     const y = sy(opts.ref);
@@ -151,11 +200,36 @@ const CHARTS = [
       { name: 'max combo', color: '#c0c0c0', f: d => d.max_combo, dashed: true },
     ] },
   { title: 'Style dials',
-    note: 'Fraction of ticks holding block / swinging — what the shaping is trying to move.',
+    note: 'Fraction of ticks holding block / swinging / jumping, in-range clicks that miss, and the share of the single most-used movement key-combo (11% = uniform over 9 moves, near 100% = movement collapse).',
     series: [
       { name: 'block %', color: '#9b59b6', f: d => d.blk },
       { name: 'click %', color: '#16a085', f: d => d.clk },
+      { name: 'jump %', color: '#3d8bff', f: d => d.jmp },
+      { name: 'whiff %', color: '#e0483e', f: d => d.whiff },
+      { name: 'top-move share', color: '#8a8a8a', f: d => d.move_top_frac, dashed: true },
     ], opts: { pct: true, y0: 0 } },
+  { title: 'Winrate vs scripted styles',
+    note: 'Per-personality winrate. A style pinned at 100% is FARMED — it produces no learning signal anymore. The boxer (added Jul 17) is the current pressure; it should start well under 50% and climb slowly.',
+    series: [
+      { name: 'turtle', color: '#2ea36b', f: d => d.wr_turtle },
+      { name: 'rusher', color: '#e0483e', f: d => d.wr_rusher },
+      { name: 'kiter', color: '#3d8bff', f: d => d.wr_kiter },
+      { name: 'boxer', color: '#d08b1f', f: d => d.wr_boxer },
+    ], opts: { pct: true, y0: 0, y1: 1, ref: 0.5 } },
+  { title: 'Exploration — policy entropy (nats)',
+    note: '"Is it still trying new things?" Uniform ceilings: move ln(9)≈2.20, click/block/jump ln(2)≈0.69. Drifting down = converging (fine if winrate rises); a head near 0 has stopped exploring entirely.',
+    series: [
+      { name: 'move', color: '#e0483e', f: d => d.ent_move },
+      { name: 'click', color: '#16a085', f: d => d.ent_click },
+      { name: 'block', color: '#9b59b6', f: d => d.ent_block },
+      { name: 'jump', color: '#3d8bff', f: d => d.ent_jump },
+    ], opts: { y0: 0 } },
+  { title: 'Aim: geometric bias vs learned lead (deg)',
+    note: 'aim_bias = where the target ACTUALLY is relative to the crosshair at combat range (negative = crosshair sits right of the target). res_yaw = the mean yaw offset the policy adds. Healthy learning = res_yaw drifting to mirror the bias (canceling it); both flat = the residual is parked and misses stay priced in.',
+    series: [
+      { name: 'aim bias', color: '#e0483e', f: d => d.aim_bias },
+      { name: 'learned lead (res_yaw)', color: '#3d8bff', f: d => d.res_yaw },
+    ], opts: { ref: 0 } },
   { title: 'Average reward',
     note: 'Per-episode return. Noisy at 20 Hz; watch the smoothed trend, not single points.',
     series: [ { name: 'avg reward', color: '#e67e22', f: d => d.avg_reward } ] },
@@ -163,12 +237,14 @@ const CHARTS = [
     note: 'Ticks between the state Python acted on and the action landing. Healthy = 1 (dashed line). Sitting near 2 = phase-locked session — the aim-spin bug.',
     series: [ { name: 'staleness', color: '#e0483e', f: d => d.staleness } ],
     opts: { ref: 1, y0: 0.8, y1: 2.2 } },
-  { title: 'Losses',
-    note: 'Policy and value loss. Spikes = the policy moved; sustained blow-up = instability.',
-    series: [
-      { name: 'policy', color: '#3d8bff', f: d => d.ploss },
-      { name: 'value', color: '#e0483e', f: d => d.vloss, dashed: true },
-    ] },
+  { title: 'Policy loss',
+    note: 'PPO policy-gradient loss — it lives near 0 and wobbles a bit each update as the policy shifts. Not a "lower is better" number; you just want it small and not exploding.',
+    series: [ { name: 'policy', color: '#3d8bff', f: d => d.ploss } ],
+    opts: { ref: 0 } },
+  { title: 'Value loss (log scale)',
+    note: 'How wrong the critic is at predicting round outcomes. Healthy is ~5-15. A spike past ~300 is a training detonation, NOT something that recovers on its own — the trainer now aborts before saving when it sees one (the Jul 17 blow-up).',
+    series: [ { name: 'value', color: '#e0483e', f: d => d.vloss } ],
+    opts: { log: true } },
 ];
 
 function render() {
@@ -180,9 +256,9 @@ function render() {
     grid.appendChild(card);
     chart(card, c.title, c.note, c.series, c.opts);
   }
-  const last = DATA[DATA.length - 1] || {};
+  const last = ROWS[ROWS.length - 1] || {};
   document.getElementById('sub').textContent =
-    `${DATA.length} updates logged · latest update ${last.update ?? '?'}`;
+    `${ROWS.length} updates logged · latest update ${last.update ?? '?'}`;
 }
 const winEl = document.getElementById('win');
 winEl.addEventListener('input', () => { document.getElementById('winv').textContent = winEl.value; render(); });
