@@ -66,6 +66,22 @@ def adapt_ckpt_move_dim(state_dict, new_n):
     return state_dict
 
 
+def adapt_ckpt_add_jump_head(state_dict, model):
+    """Insert a fresh jump_head from `model` if the checkpoint predates learned
+    jumping (jump used to be a hardcoded crit rule, so old self-play checkpoints have
+    no jump_head). Copies the model's freshly-initialized head - which is biased
+    toward NOT jumping - so a resumed policy keeps its trained behavior and starts
+    jumping only rarely, then learns the timing. No-op once the head exists, or for a
+    net without one (PvPCloner)."""
+    if "jump_head.weight" in state_dict or not hasattr(model, "jump_head"):
+        return state_dict
+    state_dict = dict(state_dict)
+    state_dict["jump_head.weight"] = model.jump_head.weight.data.clone()
+    state_dict["jump_head.bias"] = model.jump_head.bias.data.clone()
+    print("Added jump_head from fresh init (checkpoint predates learned jumping).")
+    return state_dict
+
+
 # 1. Define the Neural Network Architecture
 class PvPCloner(nn.Module):
     def __init__(self):

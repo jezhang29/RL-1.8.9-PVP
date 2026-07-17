@@ -41,7 +41,16 @@ AIM_LEAD_MAX = 1.5   # blocks, max magnitude of the velocity-lead displacement
 # angle - a small correction the RL agent learns (leading a strafing target, faking a
 # flick) without the sparse-reward cold start of learning to aim from nothing. Bounded
 # so the computed geometry stays the floor and a bad residual can't bury the crosshair.
-AIM_RES_MAX = 8.0   # deg, max magnitude of the learned yaw/pitch correction
+# The residual offsets the aim POINT, inside the proportional loop: (err + res) * GAIN.
+# It used to be added OUTSIDE, to the turn rate (err * GAIN + res) - and a constant
+# rate-residual parks the crosshair where the P-term exactly cancels it, i.e. at
+# res / GAIN = 1.67x res off-target. With the old 8 deg cap that allowed a parked
+# offset of ~13 deg, while the hitbox half-width (0.3 blocks) subtends only ~6 deg at
+# IDEAL_RANGE 2.8 - a learned one-sided habit could park the crosshair clean off the
+# side of the hitbox at max reach ("always aiming right of the person"). Inside the
+# loop the parked offset equals the residual itself, and 4 deg keeps even a fully
+# pinned residual on the box at combat range.
+AIM_RES_MAX = 4.0   # deg, max magnitude of the learned yaw/pitch aim-point offset
 
 # Attack timing - a rule, not a habit to imitate (human clicking is a metronome
 # with no state signal to learn from).
@@ -215,7 +224,8 @@ class CombatController:
                 and obs.get("on_ground", False)
                 and self.ticks_since_jump >= CRIT_GAP)
 
-    def act_policy(self, obs, movement, click, block, aim_res):
+    def act_policy(self, obs, movement, click, block, aim_res, jump=False,
+                   latch_block=True):
         """Self-play variant: the RL policy owns attack, block, W-tap and an aim
         residual; only the base aim geometry and crit-jump stay computed.
 
@@ -226,6 +236,15 @@ class CombatController:
         block    : bool - hold sword-block this tick (policy-decided blockhit timing).
         aim_res  : (yaw_res, pitch_res) degrees, the learned correction on the computed
                    angle. Clamped to +-AIM_RES_MAX so the geometry stays the floor.
+        jump     : bool - jump this tick (policy-decided crit-jump timing). Was a
+                   hardcoded post-hit rule; the policy owns it now so it can weigh a
+                   crit against the airborne-knockback downside from its observation
+                   (on_ground, tgt_airborne, both healths).
+        latch_block : True (the learner) holds a chosen block for BLOCK_MIN_TICKS so the
+                   SERVER registers it. False (scripted opponents) passes block through
+                   verbatim - they own their own block timing, and the latch would
+                   otherwise stretch a 1-tick trigger into 3 and pin, e.g., a reactive
+                   kiter in a permanent block that kills its mobility.
         """
         action = idle_action()
         action.update({k: bool(movement.get(k, False))
@@ -239,8 +258,8 @@ class CombatController:
         yaw_err, pitch_err = self._aim_errors(obs)
         res_y = clamp(float(aim_res[0]), -AIM_RES_MAX, AIM_RES_MAX)
         res_p = clamp(float(aim_res[1]), -AIM_RES_MAX, AIM_RES_MAX)
-        action["yaw_delta"] = clamp(yaw_err * AIM_GAIN + res_y, -MAX_YAW, MAX_YAW)
-        action["pitch_delta"] = clamp(pitch_err * AIM_GAIN + res_p, -MAX_PITCH, MAX_PITCH)
+        action["yaw_delta"] = clamp((yaw_err + res_y) * AIM_GAIN, -MAX_YAW, MAX_YAW)
+        action["pitch_delta"] = clamp((pitch_err + res_p) * AIM_GAIN, -MAX_PITCH, MAX_PITCH)
 
         # Track hits for parity/telemetry, but do NOT auto W-tap or auto blockhit -
         # those are exactly what the policy is here to learn.
@@ -252,18 +271,20 @@ class CombatController:
         self.ticks_since_click = 0 if click else self.ticks_since_click + 1
         # Block reduction is decided SERVER-side: the use-item packet must already be
         # processed when the attacker's hit arrives, so a 1-tick blip never registers.
-        # Once the policy commits to a block, hold it for BLOCK_MIN_TICKS so the server
-        # actually sees it (the policy re-choosing block just keeps refreshing this).
-        if block:
-            self.block_left = BLOCK_MIN_TICKS + _uplink_ticks(obs)
-        action["right_click"] = self.block_left > 0
-        if self.block_left > 0:
-            self.block_left -= 1
+        # Learner: once block is chosen, hold it for BLOCK_MIN_TICKS so the server
+        # actually sees it (re-choosing block just keeps refreshing the latch).
+        if latch_block:
+            if block:
+                self.block_left = BLOCK_MIN_TICKS + _uplink_ticks(obs)
+            action["right_click"] = self.block_left > 0
+            if self.block_left > 0:
+                self.block_left -= 1
+        else:
+            action["right_click"] = bool(block)
 
-        # --- Crit: still computed, but combo-gated and i-frame-timed (see CRIT_*) ---
-        self.ticks_since_jump += 1
-        if self._crit_jump(obs, dist):
-            action["jump"] = True
-            self.ticks_since_jump = 0
+        # --- Jump: policy-owned (was the hardcoded _crit_jump rule). The metronomic
+        # post-hit hop is gone; the policy learns when a crit-jump beats the airborne
+        # knockback risk. _crit_jump stays for the BC bot's rule-mode act() only. ---
+        action["jump"] = bool(jump)
 
         return action

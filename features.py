@@ -4,7 +4,7 @@ import math
 # Both import from here so training and inference can never drift apart.
 
 STACK = 8          # ticks of history fed to the network (0.4s at 20Hz)
-FRAME_DIM = 27     # features per tick, see frame_features()
+FRAME_DIM = 29     # features per tick, see frame_features()
 INPUT_DIM = STACK * FRAME_DIM
 MAX_RANGE = 16.0   # blocks; beyond this the bot has no data and idles
 
@@ -86,6 +86,17 @@ def frame_features(obs):
             return 0.0
         return 1.0 - min(d, 3.0) / 3.0
 
+    # v5: absolute health of both fighters, /20 (MAX_HEALTH). The policy needs these
+    # for lethal-range decisions - when a normal hit can't kill but a 1.5x CRIT can
+    # (paired with the now-learned jump), or when it's itself one hit from death and
+    # must stop trading. The mod already streams both (the reward reads them); absent
+    # only in old CSVs -> assume full. Explicit None check so health 0 (dead) reads as
+    # 0.0 rather than being swallowed by `or`.
+    _mh = obs.get("my_health")
+    _th = obs.get("tgt_health")
+    my_health01 = min(1.0, max(0.0, (_mh if _mh is not None else 20.0) / 20.0))
+    tgt_health01 = min(1.0, max(0.0, (_th if _th is not None else 20.0) / 20.0))
+
     return [
         1.0,                                                   # has_target
         dist / MAX_RANGE,
@@ -122,4 +133,7 @@ def frame_features(obs):
         0.0 if obs.get("tgt_on_ground") is None else 1.0 - float(obs["tgt_on_ground"]),
         float(obs.get("my_ray_hit") or 0.0),                   # a click right now connects
         float(obs.get("tgt_ray_hit") or 0.0),                  # THEIR next click connects
+        # v5 appended block: absolute health (see above), for lethal/crit decisions.
+        my_health01,
+        tgt_health01,
     ]

@@ -8,7 +8,8 @@ import torch
 
 # Single source of truth: architecture from train_model, features from features,
 # combat rules from combat.
-from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
+from train_model import (PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim,
+                         adapt_ckpt_add_jump_head)
 from features import frame_features, STACK, FRAME_DIM
 from combat import CombatController, idle_action
 from pvp_env import ACTIONS
@@ -93,8 +94,8 @@ def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'
     from train_selfplay import ActorCritic, DEVICE
 
     model = ActorCritic().to(DEVICE)
-    model.load_state_dict(adapt_ckpt_move_dim(
-        adapt_ckpt_frame_dim(torch.load(ckpt, map_location=DEVICE)), len(ACTIONS)))
+    model.load_state_dict(adapt_ckpt_add_jump_head(adapt_ckpt_move_dim(
+        adapt_ckpt_frame_dim(torch.load(ckpt, map_location=DEVICE)), len(ACTIONS)), model))
     model.eval()
     print(f"Self-play brain loaded from {ckpt} (learned movement + attack/block/aim).")
 
@@ -126,11 +127,13 @@ def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'
                     act, _, _ = model.act(_obs_vec(history), greedy=True)
                     w, a, s, d, sprint = ACTIONS[act["move"]]
                     movement = {"w": w, "a": a, "s": s, "d": d, "sprint": sprint}
-                    click, block, aim = act["click"], act["block"], act["aim"]
+                    click, block, jump, aim = (act["click"], act["block"],
+                                               act["jump"], act["aim"])
                 else:                # past MAX_RANGE -> chase, still aim, don't swing
-                    movement, click, block, aim = CHASE, 0, 0, (0.0, 0.0)
+                    movement, click, block, jump, aim = CHASE, 0, 0, 0, (0.0, 0.0)
 
-                action = combat.act_policy(obs, movement, bool(click), bool(block), aim)
+                action = combat.act_policy(obs, movement, bool(click), bool(block), aim,
+                                           jump=bool(jump))
                 conn.sendall((json.dumps(action) + "\n").encode('utf-8'))
     except KeyboardInterrupt:
         print("\nShutting down AI Server.")

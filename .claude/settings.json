@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m py_compile train_selfplay.py combat.py pvp_env.py)",
+      "Bash(python -c \"import ai_server, train_selfplay\")"
+    ]
+  }
+}

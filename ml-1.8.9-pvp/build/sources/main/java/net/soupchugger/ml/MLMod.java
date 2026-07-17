@@ -67,6 +67,13 @@ public class MLMod {
 
     // The "Mailbox" - Volatile ensures thread safety when reading/writing
     private volatile BotAction currentAction = new BotAction();
+    // When the last action arrived. Movement/sprint/block are HELD state re-applied
+    // every tick, so if Python pauses (a PPO update runs for seconds; each round
+    // reset starves the other client ~1s) the fighter would keep replaying its last
+    // action forever - walking into a wall holding block until the pause ends. A
+    // stale action isn't a decision: past STALE_ACTION_MS, idle instead.
+    private static final long STALE_ACTION_MS = 500;   // ~10 ticks
+    private volatile long lastActionMillis = 0;
     // A chat command the AI wants run (e.g. "/tp" to reset a self-play round).
     // Must be executed on the client thread, so onClientTick drains it.
     private volatile String pendingCommand = null;
@@ -147,6 +154,7 @@ public class MLMod {
                     }
 
                     // Put the new command in the mailbox
+                    lastActionMillis = System.currentTimeMillis();
                     currentAction = newAction;
                 }
             } catch (Exception e) {
@@ -389,8 +397,12 @@ public class MLMod {
             // before ours - wait briefly for it rather than applying a stale action.
             // lag > 4 means Python is paused (PPO update / reset), not phase-lagged;
             // ack < 0 means Python isn't echoing (old server) - don't wait for those.
+            // Watchdog first (see STALE_ACTION_MS): if Python has gone quiet, don't
+            // wait on it and don't replay the held keys - act idle until it's back.
+            boolean pythonPaused = lastActionMillis > 0
+                    && System.currentTimeMillis() - lastActionMillis > STALE_ACTION_MS;
             long lag = (thisTick - 1) - currentAction.ack_tick;
-            if (currentAction.ack_tick >= 0 && lag >= 1 && lag <= 4) {
+            if (!pythonPaused && currentAction.ack_tick >= 0 && lag >= 1 && lag <= 4) {
                 int waited = 0;
                 while (waited < FRESH_WAIT_MS
                         && (thisTick - 1) - currentAction.ack_tick >= 1) {
@@ -399,7 +411,9 @@ public class MLMod {
                 }
                 staleWaitedMs += waited;
             }
-            BotAction action = currentAction;
+            // A fresh BotAction is all-false/zero (ack -1, so staleness bookkeeping
+            // below skips it) - exactly "release everything".
+            BotAction action = pythonPaused ? new BotAction() : currentAction;
 
             // Staleness bookkeeping: summary line every 200 ticks (~10 s).
             if (action.ack_tick >= 0) {
