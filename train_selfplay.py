@@ -787,6 +787,17 @@ def main():
                 "ploss": p_loss, "vloss": v_loss, "staleness": dmg["staleness"],
             })
             recent_avg.append(avg_r)
+            # Divergence firewall. With the reward now bounded (pvp_env REWARD_CLIP) a
+            # healthy value loss stays well under 100; the historic collapse ran it into
+            # the millions while every action head saturated to "hold jump+block". A
+            # spike past this ceiling (or a NaN) means training has detonated - stop
+            # immediately, BEFORE any save, so the clean best/latest checkpoints and the
+            # pool snapshots are never overwritten with poison. Better to wake to a
+            # halted run at a good checkpoint than to hours of a broken one.
+            if not np.isfinite(v_loss) or not np.isfinite(avg_r) or v_loss > 300:
+                print(f"  !! DIVERGENCE DETECTED (vloss {v_loss:.0f}, avg_r {avg_r:+.0f}) "
+                      f"- aborting without saving; best/latest/pool preserved")
+                break
             # Snapshot gate counts SNAPSHOT rounds only: early losses to the scripted
             # styles (expected - the turtle beats today's policy by design) must not
             # freeze pool growth, which is gated on beating one's own past.
