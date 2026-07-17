@@ -18,6 +18,7 @@ import csv
 import os
 import random
 import select
+import time
 from collections import deque
 
 import numpy as np
@@ -76,7 +77,10 @@ ENT_COEF = 0.01
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 TOTAL_UPDATES = 2000
-SNAPSHOT_EVERY = 25       # updates between adding the current policy to the pool
+# 10, not 25: at 25 a restarted run spent its first ~2 hours fighting only the
+# resume-point snapshot (winrate drifted to 90-100% = no learning signal left).
+# 10 keeps the pool tracking the learner; POOL_SIZE 10 still spans 100 updates.
+SNAPSHOT_EVERY = 10       # updates between adding the current policy to the pool
 POOL_SIZE = 10
 
 LEARNER_PORT = 9999
@@ -324,6 +328,8 @@ class ScriptedOpponent:
         self.prev_tgt_hurt = 0
         self.wtap = 0
         self.tick = 0
+        self.starved = 0   # turtle: consecutive band ticks with the target out of reach
+        self.reclose = 0   # turtle: sprint-burst ticks left (block down to re-close)
 
     def act(self, obs_np, greedy=False):
         s = self.env.last_state or {}
@@ -342,8 +348,27 @@ class ScriptedOpponent:
             # lands the first tick reach is entered; block-hitting = half damage in,
             # full out). Outside it, sprint sword-down to close (can't chase at sneak
             # speed - that mobility tradeoff is the style's real weakness, on purpose).
-            if 0.0 < d <= 4.25:
+            # The threat band alone got FARMED once the learner found the counter:
+            # sit at ~3.4 (just past the turtle's ~3 reach), poke, and let sneak
+            # speed guarantee the turtle never closes - it read as "held block for
+            # seconds and died swinging at air" (wr vs turtle hit 100%). A human
+            # turtle answers edge-farming by dropping block and sprinting the gap
+            # shut. So: track consecutive band ticks with the target OUT of own
+            # reach ("starved"); past the threshold, burst in sword-down for a few
+            # ticks, then resume turtling. Hysteresis matters - the threshold (8)
+            # rides out ordinary knockback bounces, so this does NOT reintroduce
+            # the old drop-block-while-being-hit punching-bag flap.
+            if 0.0 < d <= 3.2:
+                self.starved = 0                        # in reach: trades are landing
+            elif 0.0 < d <= 4.25:
+                self.starved += 1                       # blocking but can't reach
+            if self.reclose > 0:
+                self.reclose -= 1                       # sprint-burst: block down
+                move, click = 0, int(swing and 0.0 < d <= 4.5)
+            elif 0.0 < d <= 4.25:
                 move, block, click = 3, 1, int(swing)
+                if self.starved > 8:                    # edge-farmed: force the gap shut
+                    self.reclose, self.starved = 6, 0
             else:
                 move = 0                                # sprint in, sword down
         elif self.style == "rusher":
@@ -620,19 +645,34 @@ def main():
 
     model = ActorCritic().to(DEVICE)
     warm_start_from_bc(model)
+
+    def load_adapted(path):
+        """Load a self-play checkpoint, remapping older layouts (frame dim, move
+        dim, jump head) onto the current architecture."""
+        return adapt_ckpt_add_jump_head(adapt_ckpt_move_dim(
+            adapt_ckpt_frame_dim(torch.load(path, map_location=DEVICE)),
+            ACTION_DIMS["move"]), model)
+
     # Resume from the last self-play checkpoint if there is one, so restarting the
     # trainer (reward tweaks, crashes) continues the run instead of starting over.
     try:
-        model.load_state_dict(adapt_ckpt_add_jump_head(adapt_ckpt_move_dim(
-            adapt_ckpt_frame_dim(torch.load("pvp_selfplay_latest.pth", map_location=DEVICE)),
-            ACTION_DIMS["move"]), model))
+        model.load_state_dict(load_adapted("pvp_selfplay_latest.pth"))
         print("Resumed from pvp_selfplay_latest.pth")
     except FileNotFoundError:
         print("No self-play checkpoint - starting from the BC warm start.")
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 
-    # Opponent pool: (tag, weights) so results can be split by snapshot age
+    # Opponent pool: (tag, weights) so results can be split by snapshot age.
+    # Seed with BEST alongside the resume point: a restart otherwise spars only
+    # against one frozen self until the first snapshot lands, and best is the
+    # strongest partner on disk (it also can't be weaker than start by much, so
+    # it never dilutes the pool the way an arbitrary old checkpoint could).
     pool = [("start", copy.deepcopy(model.state_dict()))]
+    try:
+        pool.append(("best", load_adapted("pvp_selfplay_best.pth")))
+        print("Seeded pool with pvp_selfplay_best.pth")
+    except FileNotFoundError:
+        pass
     opponent = ActorCritic().to(DEVICE)
 
     def set_opponent_from(entry):
@@ -724,6 +764,16 @@ def main():
                   f"whiff {dmg['whiff']:4.0%} bias {dmg['aim_bias']:+5.1f} | "
                   f"avg reward {avg_r:+6.2f} | ploss {p_loss:+.3f} vloss {v_loss:.3f} | "
                   f"lat {dmg['staleness']:.2f}")
+            # Per-opponent W-L (kills-deaths from the LEARNER's side), so a single
+            # dominant sparring partner is identifiable by tag instead of showing
+            # up only as an anonymous dip in the aggregate winrate.
+            by_tag = {}
+            for r, _, t, _ in results:
+                by_tag.setdefault(t, []).append(r)
+            print("           vs " + "  ".join(
+                f"{t} {sum(1 for r in rs if r == 'kill')}-"
+                f"{sum(1 for r in rs if r == 'death')}"
+                for t, rs in sorted(by_tag.items())))
             append_metrics({
                 "update": update, "rounds": len(results), "timeouts": timeouts,
                 "winrate": wins / len(results),
@@ -758,7 +808,14 @@ def main():
                 pool.append((f"u{update}", copy.deepcopy(model.state_dict())))
                 if len(pool) > POOL_SIZE:
                     pool.pop(0)
-                print(f"  snapshot added (pool size {len(pool)})")
+                # Also persist the snapshot: pool entries otherwise live only in
+                # this process, so a strong sparring partner (the kind worth
+                # keeping) would vanish on pool rotation or a trainer restart.
+                # Timestamped because the update counter restarts at 1 every run.
+                os.makedirs("pool_snapshots", exist_ok=True)
+                snap_path = f"pool_snapshots/{time.strftime('%b%d_%H%M')}_u{update}.pth"
+                torch.save(model.state_dict(), snap_path)
+                print(f"  snapshot added (pool size {len(pool)}) -> {snap_path}")
             else:
                 print(f"  snapshot SKIPPED (winrate {wr_since:.0%} since last < 45%)")
             snap_wins = snap_rounds = 0
