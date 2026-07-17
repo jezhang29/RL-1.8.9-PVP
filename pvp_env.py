@@ -70,6 +70,12 @@ KILL_REWARD = 10.0
 DEATH_REWARD = -10.0
 TIME_PENALTY = 0.01   # per tick, so stalling forever is never optimal
 MAX_HEALTH = 20.0
+# Firewall: hard bound on any single tick's reward. A legit tick tops out near a
+# kill (finishing hit ~6 + KILL_REWARD 10 + bonuses), so +-20 never clips real
+# gameplay - but it caps any shaping bug so it can't blow up the value target. An
+# un-clamped aim tax once drove returns to -1e5 and saturated every head into a
+# "hold jump+block" corner; this is the last line of defense against a repeat.
+REWARD_CLIP = 20.0
 
 # --- dense shaping ----------------------------------------------------------
 # All of these are small next to a landed sword hit (~6 health units), so they steer
@@ -343,11 +349,15 @@ class PvPEnv:
         if taken > 0.0 and (state.get("my_block") or 0.0):
             reward += BLOCKED_HIT_BONUS
 
-        # Aim-residual tax (see AIM_RES_COEF): penalize the squared residual the policy
-        # actually emitted this tick, so the aim head can't drift into a free-floating
-        # offset that spins the crosshair. Raw (pre-clamp) value, so the pushback keeps
-        # growing even past +-AIM_RES_MAX instead of saturating with the applied clamp.
-        res_y, res_p = float(action["aim"][0]), float(action["aim"][1])
+        # Aim-residual tax (see AIM_RES_COEF): penalize the residual the policy emitted
+        # this tick, so the aim head can't drift into a free-floating offset that spins
+        # the crosshair. Bounded to +-AIM_RES_MAX (the clamp already applied to the
+        # game) before squaring: residuals past the clamp don't change gameplay, so
+        # taxing them un-bounded bought nothing - but it let a drifting Gaussian mean
+        # feed a quadratic penalty with no ceiling, which detonated the value loss and
+        # collapsed the policy into "hold jump+block". The tax now maxes at a fixed cost.
+        res_y = max(-AIM_RES_MAX, min(AIM_RES_MAX, float(action["aim"][0])))
+        res_p = max(-AIM_RES_MAX, min(AIM_RES_MAX, float(action["aim"][1])))
         reward -= AIM_RES_COEF * (res_y * res_y + res_p * res_p)
 
         # Whiff: swung inside reach but the crosshair ray missed the AABB (the exact
@@ -426,6 +436,8 @@ class PvPEnv:
             info["result"] = "timeout"
 
         self.last_state = state
+        # Firewall (see REWARD_CLIP): last bound before the value target sees this.
+        reward = max(-REWARD_CLIP, min(REWARD_CLIP, reward))
         return self._obs_vector(), reward, done, info
 
     def step(self, action):
