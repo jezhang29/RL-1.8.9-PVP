@@ -27,7 +27,8 @@ from collections import deque
 
 import numpy as np
 
-from features import frame_features, STACK, FRAME_DIM, INPUT_DIM
+from features import (frame_features, calculate_optimal_angles, wrap_degrees,
+                      STACK, FRAME_DIM, INPUT_DIM)
 from combat import CombatController, AIM_RES_MAX
 
 # Discrete movement vocabulary. Sprint only engages moving forward in 1.8, so the
@@ -55,10 +56,14 @@ N_ACTIONS = len(ACTIONS)
 #   move  : Discrete(N_ACTIONS)     - which movement primitive
 #   click : Discrete(2)             - swing or not (tick rate is the only CPS cap)
 #   block : Discrete(2)             - hold sword-block or not
+#   jump  : Discrete(2)             - jump this tick (crit-jump timing, LEARNED - was a
+#                                     hardcoded post-hit rule; the policy now decides
+#                                     when a crit is worth the airborne-knockback risk)
 #   aim   : Box(2)                  - yaw/pitch residual (deg), clamped to +-AIM_RES_MAX
 MOVE_DIM = N_ACTIONS
 CLICK_DIM = 2
 BLOCK_DIM = 2
+JUMP_DIM = 2
 AIM_DIM = 2
 
 KILL_REWARD = 10.0
@@ -287,7 +292,8 @@ class PvPEnv:
         mod_action = self.combat.act_policy(
             self.last_state, movement,
             click=bool(action["click"]), block=bool(action["block"]),
-            aim_res=action["aim"])
+            aim_res=action["aim"], jump=bool(action.get("jump", False)),
+            latch_block=bool(action.get("latch_block", True)))
         # Simulated latency: hold the BODY inputs (move/click/block/jump) sim_lag
         # ticks before they reach the mod - that models the ping-delayed control
         # loop and gives the ping features signal. But the AIM (yaw/pitch) is NOT
@@ -348,8 +354,10 @@ class PvPEnv:
         # client-side hit test, see WHIFF_PENALTY). state.get is None on an old jar
         # (no my_ray_hit key) -> no penalty; 0.0 = a real miss -> penalized.
         ray_hit = state.get("my_ray_hit")
-        if (action["click"] and ray_hit is not None and not ray_hit
-                and new_d is not None and 0.0 < new_d <= WHIFF_RANGE):
+        click_eval = bool(action["click"] and ray_hit is not None
+                          and new_d is not None and 0.0 < new_d <= WHIFF_RANGE)
+        whiffed = click_eval and not ray_hit
+        if whiffed:
             reward -= WHIFF_PENALTY
 
         # First blood, once per round, signed
@@ -391,7 +399,20 @@ class PvPEnv:
         # staleness = mod-reported control-loop lag in ticks (healthy 1, spin-phase 2;
         # -1/absent until the updated jar is running).
         info = {"dealt": dealt, "taken": taken, "combo": self.combo,
-                "staleness": state.get("staleness", -1)}
+                "staleness": state.get("staleness", -1),
+                # Aim-quality telemetry: whiff = in-range click whose crosshair ray
+                # missed; click_eval = the denominator (in-range clicks with the new
+                # jar's ray key present). Rollout aggregates these into a whiff rate.
+                "whiff": whiffed, "click_eval": click_eval}
+        # Signed geometric yaw error (no lead, no residual) at combat range, for the
+        # aim-bias metric. Positive = the target sits RIGHT of the crosshair (we still
+        # need to turn right); NEGATIVE = the crosshair sits right of the target - a
+        # persistent negative mean is exactly the reported "always aims to the right".
+        if new_d is not None and 0.0 < new_d <= 6.0:
+            t_yaw, _ = calculate_optimal_angles(
+                state["player_x"], state["player_y"], state["player_z"],
+                state["target_x"], state["target_y"], state["target_z"])
+            info["yaw_err"] = wrap_degrees(t_yaw - state["player_yaw"])
         if my_h <= 0.0:
             reward += DEATH_REWARD
             done = True
@@ -422,5 +443,6 @@ class PvPEnv:
 # Observation/action dims for the trainer to import
 OBS_DIM = INPUT_DIM
 ACT_DIM = N_ACTIONS          # kept for back-compat; = MOVE_DIM
-# Composite heads: (move, click, block, aim); AIM_RES_MAX bounds the aim residual.
-ACTION_DIMS = {"move": MOVE_DIM, "click": CLICK_DIM, "block": BLOCK_DIM, "aim": AIM_DIM}
+# Composite heads: (move, click, block, jump, aim); AIM_RES_MAX bounds the aim residual.
+ACTION_DIMS = {"move": MOVE_DIM, "click": CLICK_DIM, "block": BLOCK_DIM,
+               "jump": JUMP_DIM, "aim": AIM_DIM}
