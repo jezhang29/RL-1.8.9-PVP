@@ -157,8 +157,15 @@ public class MLMod {
                     lastActionMillis = System.currentTimeMillis();
                     currentAction = newAction;
                 }
+                // readLine() == null: Python closed the socket CLEANLY (normal
+                // trainer shutdown/restart). Fall through to the retry below -
+                // this path used to skip the catch block entirely, leaving
+                // out/isConnecting set, so a clean restart of the trainer meant
+                // relaunching the whole client to ever reconnect.
             } catch (Exception e) {
-                System.err.println("[Telemetry] Connection lost. Retrying...");
+                // Hard drop (trainer crash, parse error) - same recovery.
+            } finally {
+                System.err.println("[Telemetry] Connection lost. Retrying in 5s...");
                 out = null;
                 in = null;
                 isConnecting = false;

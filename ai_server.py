@@ -8,8 +8,7 @@ import torch
 
 # Single source of truth: architecture from train_model, features from features,
 # combat rules from combat.
-from train_model import (PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim,
-                         adapt_ckpt_add_jump_head)
+from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
 from features import frame_features, STACK, FRAME_DIM
 from combat import CombatController, idle_action
 from pvp_env import ACTIONS
@@ -88,14 +87,18 @@ def start_bc_bot(host='127.0.0.1', port=9999):
 
 
 def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'):
-    """Self-play policy: learned movement AND learned attack/block/W-tap + aim residual
-    (combat.act_policy). This is the trained result of train_selfplay.py."""
+    """Self-play policy: learned movement + attack + defensive-block + aim residual, with
+    the post-hit blockhit and crit-jump as scripted reflexes (combat.act_policy). This is
+    the trained result of train_selfplay.py."""
     # Imported here so the BC path doesn't depend on the RL module.
     from train_selfplay import ActorCritic, DEVICE
 
     model = ActorCritic().to(DEVICE)
-    model.load_state_dict(adapt_ckpt_add_jump_head(adapt_ckpt_move_dim(
-        adapt_ckpt_frame_dim(torch.load(ckpt, map_location=DEVICE)), len(ACTIONS)), model))
+    # Drop any jump_head.* keys after the frame/move remap: the jump head was removed
+    # when crit-jump became a scripted reflex, so older checkpoints still load.
+    sd = adapt_ckpt_move_dim(
+        adapt_ckpt_frame_dim(torch.load(ckpt, map_location=DEVICE)), len(ACTIONS))
+    model.load_state_dict({k: v for k, v in sd.items() if not k.startswith("jump_head")})
     model.eval()
     print(f"Self-play brain loaded from {ckpt} (learned movement + attack/block/aim).")
 
@@ -123,17 +126,16 @@ def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'
                     conn.sendall((json.dumps(idle_action()) + "\n").encode('utf-8'))
                     continue
 
-                if frame[0] == 1.0:  # in range -> the policy owns everything
+                if frame[0] == 1.0:  # in range -> the policy owns the situational choices
                     act, _, _ = model.act(_obs_vec(history), greedy=True)
                     w, a, s, d, sprint = ACTIONS[act["move"]]
                     movement = {"w": w, "a": a, "s": s, "d": d, "sprint": sprint}
-                    click, block, jump, aim = (act["click"], act["block"],
-                                               act["jump"], act["aim"])
+                    click, block, aim = act["click"], act["block"], act["aim"]
                 else:                # past MAX_RANGE -> chase, still aim, don't swing
-                    movement, click, block, jump, aim = CHASE, 0, 0, 0, (0.0, 0.0)
+                    movement, click, block, aim = CHASE, 0, 0, (0.0, 0.0)
 
-                action = combat.act_policy(obs, movement, bool(click), bool(block), aim,
-                                           jump=bool(jump))
+                # Blockhit sprint-reset and crit-jump are scripted inside act_policy.
+                action = combat.act_policy(obs, movement, bool(click), bool(block), aim)
                 conn.sendall((json.dumps(action) + "\n").encode('utf-8'))
     except KeyboardInterrupt:
         print("\nShutting down AI Server.")

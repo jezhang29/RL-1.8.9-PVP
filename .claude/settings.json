@@ -5,7 +5,10 @@
       "Bash(python -m py_compile train_selfplay.py combat.py pvp_env.py)",
       "Bash(python -c \"import ai_server, train_selfplay\")",
       "Bash(python -m py_compile train_selfplay.py)",
-      "Bash(python -)"
+      "Bash(python -)",
+      "Bash(.venv/bin/python -)",
+      "Bash(grep -niA1 \"option\\\\|approach\\\\|imitation\\\\|behavioral\\\\|self-play\\\\|league\\\\|reward\" /Users/jzhang/Documents/VSCode/RL-1.8.9-PVP/RUN.md)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('pvp_env.py', doraise=True\\); print\\('pvp_env.py OK'\\)\")"
     ]
   }
 }

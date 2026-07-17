@@ -224,27 +224,37 @@ class CombatController:
                 and obs.get("on_ground", False)
                 and self.ticks_since_jump >= CRIT_GAP)
 
-    def act_policy(self, obs, movement, click, block, aim_res, jump=False,
-                   latch_block=True):
-        """Self-play variant: the RL policy owns attack, block, W-tap and an aim
-        residual; only the base aim geometry and crit-jump stay computed.
+    def act_policy(self, obs, movement, click, block, aim_res, latch_block=True):
+        """Self-play variant: the RL policy owns MOVEMENT, ATTACK, a defensive BLOCK
+        posture and an aim residual. The mechanical, event-timed techniques stay
+        COMPUTED - like aim - because their correct timing is a known function of an
+        event, not something worth learning from sparse reward at 20 Hz:
 
-        movement : dict of w/a/s/d/sprint (bools) - the movement primitive. W-tap is
-                   just the policy choosing a no-sprint primitive right after a hit, so
-                   it is NOT forced here the way rule mode forces it.
+          - blockhit sprint-reset : a short block pulse fired the tick we land a hit
+            (block cancels sprint, so the next hit re-triggers sprint knockback, and
+            the raised sword buys spacing/reduction). This is the human "tap block
+            right after connecting", which is only correct RELATIVE TO THE HIT - a
+            learned per-tick coin flip could never time it, and un-gated it just spams.
+          - crit-jump : jump ONLY inside the falling i-frame window right after our own
+            hit (see _crit_jump). The learned jump head is GONE: a hop at any other
+            time is pure airborne-knockback downside, which is exactly what produced
+            the ~35% bunny-hop equilibrium a grounded human trivially punished.
+
+        What stays LEARNED is the situational judgment: which movement primitive
+        (engage / retreat / strafe / straight-line / s-tap), whether to commit a swing,
+        whether to hold a SUSTAINED defensive block (the "trade against a cornered
+        opponent" read), and the aim residual.
+
+        movement : dict of w/a/s/d/sprint (bools) - the movement primitive.
         click    : bool - swing this tick (policy-decided; the tick rate is the only cap).
-        block    : bool - hold sword-block this tick (policy-decided blockhit timing).
+        block    : bool - hold a defensive sword-block this tick (policy-decided posture).
         aim_res  : (yaw_res, pitch_res) degrees, the learned correction on the computed
                    angle. Clamped to +-AIM_RES_MAX so the geometry stays the floor.
-        jump     : bool - jump this tick (policy-decided crit-jump timing). Was a
-                   hardcoded post-hit rule; the policy owns it now so it can weigh a
-                   crit against the airborne-knockback downside from its observation
-                   (on_ground, tgt_airborne, both healths).
-        latch_block : True (the learner) holds a chosen block for BLOCK_MIN_TICKS so the
-                   SERVER registers it. False (scripted opponents) passes block through
-                   verbatim - they own their own block timing, and the latch would
-                   otherwise stretch a 1-tick trigger into 3 and pin, e.g., a reactive
-                   kiter in a permanent block that kills its mobility.
+        latch_block : True (the learner) gets the scripted post-hit blockhit reflex and
+                   holds a chosen block for BLOCK_MIN_TICKS so the SERVER registers it.
+                   False (scripted opponents) passes block through verbatim and gets NO
+                   reflexes - each style owns its own timing (and stays grounded by
+                   design), so injecting a blockhit/crit would corrupt the curriculum.
         """
         action = idle_action()
         action.update({k: bool(movement.get(k, False))
@@ -261,30 +271,43 @@ class CombatController:
         action["yaw_delta"] = clamp((yaw_err + res_y) * AIM_GAIN, -MAX_YAW, MAX_YAW)
         action["pitch_delta"] = clamp((pitch_err + res_p) * AIM_GAIN, -MAX_PITCH, MAX_PITCH)
 
-        # Track hits for parity/telemetry, but do NOT auto W-tap or auto blockhit -
-        # those are exactly what the policy is here to learn.
+        # --- Event: did we land a hit this tick? hurtTime is slammed to 10 on damage. ---
         tgt_hurt = obs.get("tgt_hurt", 0) or 0
+        landed = tgt_hurt > self.prev_tgt_hurt
         self.prev_tgt_hurt = tgt_hurt
 
-        # --- Attack & block: policy-driven ---
+        # --- Attack (policy-driven) ---
         action["left_click"] = bool(click)
         self.ticks_since_click = 0 if click else self.ticks_since_click + 1
-        # Block reduction is decided SERVER-side: the use-item packet must already be
-        # processed when the attacker's hit arrives, so a 1-tick blip never registers.
-        # Learner: once block is chosen, hold it for BLOCK_MIN_TICKS so the server
-        # actually sees it (re-choosing block just keeps refreshing the latch).
+
+        # --- Block: policy defensive posture OR the scripted post-hit blockhit, both
+        # feeding one hold counter. Reduction is decided SERVER-side, so a block must
+        # be held (BLOCK_MIN_TICKS / BLOCK_TICKS + uplink) to register - a 1-tick blip
+        # never does. Scripted opponents (latch_block False) own their block verbatim.
         if latch_block:
+            if landed:
+                self.block_left = max(self.block_left, BLOCK_TICKS + _uplink_ticks(obs))
             if block:
-                self.block_left = BLOCK_MIN_TICKS + _uplink_ticks(obs)
-            action["right_click"] = self.block_left > 0
+                self.block_left = max(self.block_left, BLOCK_MIN_TICKS + _uplink_ticks(obs))
+            holding = self.block_left > 0
             if self.block_left > 0:
                 self.block_left -= 1
         else:
-            action["right_click"] = bool(block)
+            holding = bool(block)
+        # No autoblock: in 1.8 you cannot swing while the sword is up, so a swing always
+        # wins the tick over the block (release-to-hit = the manual blockhit). And you
+        # cannot SPRINT while blocking, so a held block drops sprint - which is exactly
+        # what resets it for the next hit's sprint-knockback.
+        action["right_click"] = holding and not action["left_click"]
+        if action["right_click"]:
+            action["sprint"] = False
 
-        # --- Jump: policy-owned (was the hardcoded _crit_jump rule). The metronomic
-        # post-hit hop is gone; the policy learns when a crit-jump beats the airborne
-        # knockback risk. _crit_jump stays for the BC bot's rule-mode act() only. ---
-        action["jump"] = bool(jump)
+        # --- Crit-jump: scripted reflex, learner only (see _crit_jump / the docstring).
+        # The falling half of the jump must land inside the victim's reopening damage
+        # window, right after our own hit - the one profitable jump in the fight. ---
+        self.ticks_since_jump += 1
+        if latch_block and self._crit_jump(obs, dist):
+            action["jump"] = True
+            self.ticks_since_jump = 0
 
         return action
