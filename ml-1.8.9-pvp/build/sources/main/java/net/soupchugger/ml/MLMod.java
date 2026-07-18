@@ -204,9 +204,65 @@ public class MLMod {
         return -1.0;
     }
 
+    // Radial wall map: wallDistance along 8 lanes at 45 degree steps around a
+    // fighter. Lane 0 points along (dirX, dirZ) - we pass the axis toward the
+    // OTHER fighter, so the lanes are rotation-invariant "toward them / my back /
+    // my flanks" rather than compass directions. Lane 4 therefore duplicates the
+    // old single back-lane scan (my_wall/tgt_wall), which stays for checkpoint
+    // compatibility. Knockback rarely lands exactly on the attacker axis (strafes,
+    // aim offsets), so the diagonals are what make cornering readable.
+    private void addRadialWalls(JsonObject json, String prefix, EntityPlayer p,
+                                double dirX, double dirZ) {
+        double mag = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        if (mag < 1e-6) { dirX = 1.0; dirZ = 0.0; mag = 1.0; }
+        dirX /= mag; dirZ /= mag;
+        for (int k = 0; k < 8; k++) {
+            double ang = Math.toRadians(45.0 * k);
+            double c = Math.cos(ang), s = Math.sin(ang);
+            json.addProperty(prefix + k,
+                    wallDistance(p, dirX * c - dirZ * s, dirX * s + dirZ * c));
+        }
+    }
+
+    // Jumpable step directly ahead along (dirX, dirZ): a block at shin height
+    // within a block of us, with head + above-head clear above the step, i.e. a
+    // single hop puts us on top. Distinguishes "1-block step, jump it" from a
+    // real wall (which reads solid at head height too and stays wallDistance's
+    // business). Feeds the scripted step-up hop in combat.py - the learned jump
+    // head is gone, so terrain jumps must be reflexes like the crit-jump.
+    private boolean stepUpAhead(EntityPlayer p, double dirX, double dirZ) {
+        double mag = Math.sqrt(dirX * dirX + dirZ * dirZ);
+        if (mag < 1e-6) return false;
+        dirX /= mag; dirZ /= mag;
+        for (double d = 0.5; d <= 1.0; d += 0.5) {
+            double x = p.posX + dirX * d;
+            double z = p.posZ + dirZ * d;
+            if (isSolid(x, p.posY + 0.5, z)
+                    && !isSolid(x, p.posY + 1.5, z)
+                    && !isSolid(x, p.posY + 2.5, z)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean isSolid(double x, double y, double z) {
         return mc.theWorld.getBlockState(new BlockPos(x, y, z))
                 .getBlock().getMaterial().blocksMovement();
+    }
+
+    // Height of a player's feet above the first solid block below them, in blocks,
+    // capped at 4 (a normal jump apexes ~1.25; knockback arcs a bit higher). 0 =
+    // standing on the ground. This is the "how far into a jump/knockback arc are
+    // they" signal: a falling player (height shrinking) is in their crit window and
+    // can't change direction; a rising one just left the ground. fallDistance would
+    // miss the rising half and doesn't sync for remote players - a block scan works
+    // identically for both fighters. Quarter-block steps match wallDistance's spirit.
+    private double groundHeight(EntityPlayer p) {
+        for (double d = 0.0; d < 4.0; d += 0.25) {
+            if (isSolid(p.posX, p.posY - d - 0.05, p.posZ)) return d;
+        }
+        return 4.0;
     }
 
     // Does `looker`'s crosshair ray (out to `reach` blocks) pass through `victim`'s
@@ -310,6 +366,10 @@ public class MLMod {
             // Session bookkeeping - lets Python detect gaps when stacking frames
             json.addProperty("tick", thisTick);
             json.addProperty("recording", isRecording);
+            // Whether the bot is driving this client (P toggles it). When false a HUMAN
+            // took over, so the self-play trainer must not attribute this round to the
+            // scripted style it scheduled (the actions it sends are being ignored).
+            json.addProperty("ai_active", isAiActive);
             // Last measured control-loop lag (ticks); healthy 1, phase-locked 2,
             // -1 until Python starts echoing ack_tick. Lets the trainer log it.
             json.addProperty("staleness", lastStaleness);
@@ -333,6 +393,7 @@ public class MLMod {
             json.addProperty("my_sprint", mc.thePlayer.isSprinting());
             json.addProperty("my_block", mc.thePlayer.isBlocking());
             json.addProperty("my_ping", pingOf(mc.thePlayer));
+            json.addProperty("my_ground_h", groundHeight(mc.thePlayer));
 
             if (target != null) {
                 json.addProperty("target_x", target.posX);
@@ -359,12 +420,19 @@ public class MLMod {
                 double kbZ = target.posZ - mc.thePlayer.posZ;
                 json.addProperty("tgt_wall", wallDistance(target, kbX, kbZ));
                 json.addProperty("my_wall", wallDistance(mc.thePlayer, -kbX, -kbZ));
+                // Full radial wall map (v7): lane 0 = toward the other fighter,
+                // 45-degree steps; lane 4 = the back/knockback lane above.
+                addRadialWalls(json, "my_rwall_", mc.thePlayer, kbX, kbZ);
+                addRadialWalls(json, "tgt_rwall_", target, -kbX, -kbZ);
+                // 1-block jumpable step between us and them (scripted hop trigger)
+                json.addProperty("my_step_up", stepUpAhead(mc.thePlayer, kbX, kbZ));
                 // Remote onGround is driven by the server's movement packets - it's
                 // the airborne/juggle state (air friction 0.91 vs ~0.546 grounded,
                 // so airborne victims fly ~4x further per hit).
                 json.addProperty("tgt_on_ground", target.onGround);
                 json.addProperty("my_ray_hit", lookRayHits(mc.thePlayer, target, 3.0));
                 json.addProperty("tgt_ray_hit", lookRayHits(target, mc.thePlayer, 3.0));
+                json.addProperty("tgt_ground_h", groundHeight(target));
             } else {
                 json.addProperty("target_dist", -1.0);
             }

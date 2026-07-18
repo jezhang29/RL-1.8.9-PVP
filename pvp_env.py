@@ -50,6 +50,13 @@ ACTIONS = [
     # the spacing line - the "back off half a step, stay at max reach" move that
     # separates trading from combo control.
     (False, False, True,  False, False),  # 8 s-tap straight back
+    # Appended: full key release. Distinct from the s-tap - no brake, momentum
+    # decays through friction/knockback naturally. This is the physical primitive
+    # behind the whole hitselection family (release on getting hit, repress W at
+    # the knockback arc's peak to control hit sequencing in a trade); the policy
+    # already sees my_hurt / my_vy / my_ground_h, it just couldn't express the
+    # release until now.
+    (False, False, False, False, False),  # 9 idle (hitselect release)
 ]
 N_ACTIONS = len(ACTIONS)
 
@@ -156,6 +163,19 @@ AIM_RES_COEF = 0.002
 WHIFF_PENALTY = 0.10
 WHIFF_RANGE = 3.0     # blocks; matches the mod's 3.0 ray reach - past this a dead-on
                       # ray legitimately falls short, so no penalty out there
+# Hesitation: the mirror image of the whiff tax. Observed live: the bot sometimes
+# stands at reach and only starts swinging AFTER it takes a hit. The whiff tax alone
+# makes that a priced-in habit - clicking with unsettled aim costs 0.10 a miss, while
+# passing on a free hit costs nothing, so "wait until something (usually getting hit)
+# stabilizes the geometry" is the cheap corner. Charge the pass: crosshair ray ON the
+# target (my_ray_hit in the frame the policy acted from), inside reach, target's
+# damage window OPEN (tgt_hurt 0 - clicking into i-frames deals nothing, no charge),
+# and the policy neither clicked nor blocked (a held block is a legitimate posture,
+# not hesitation). In 1.8 there is no attack cooldown, so a click under exactly these
+# conditions is always correct - this taxes pure passivity only. Sized under the
+# whiff tax so "click when the ray connects, hold off when it doesn't" stays the
+# ordering; both are trivially bounded per tick.
+HESITATION_PENALTY = 0.04
 # NOTE: jump used to be a learned policy head and ran away to ~35% of ticks (constant
 # bunny-hopping = permanently airborne = full knockback taken, the "how is this so bad"
 # fight). It cost an AIRBORNE_HIT_PENALTY + JUMP_TAX pair of shaping band-aids. The
@@ -386,6 +406,17 @@ class PvPEnv:
         whiffed = click_eval and not ray_hit
         if whiffed:
             reward -= WHIFF_PENALTY
+
+        # Hesitation (see HESITATION_PENALTY): judged on the PRE-action frame - the
+        # state the policy actually decided from. Free hit available (ray on target,
+        # in reach, their damage window open) and the policy neither swung nor held
+        # block -> charged. None-safe: an old jar never streams my_ray_hit, so this
+        # stays off there, exactly like the whiff tax.
+        if (not action["click"] and not action["block"]
+                and (self.last_state.get("my_ray_hit") or 0.0)
+                and (self.last_state.get("tgt_hurt") or 0) == 0
+                and prev_d is not None and 0.0 < prev_d <= WHIFF_RANGE):
+            reward -= HESITATION_PENALTY
 
         # (The old JUMP_TAX / AIRBORNE_HIT_PENALTY shaping is gone: jump is no longer a
         # policy head but a scripted crit reflex that only fires inside the victim's

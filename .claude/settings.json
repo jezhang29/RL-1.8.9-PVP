@@ -8,7 +8,9 @@
       "Bash(python -)",
       "Bash(.venv/bin/python -)",
       "Bash(grep -niA1 \"option\\\\|approach\\\\|imitation\\\\|behavioral\\\\|self-play\\\\|league\\\\|reward\" /Users/jzhang/Documents/VSCode/RL-1.8.9-PVP/RUN.md)",
-      "Bash(python -c \"import py_compile; py_compile.compile\\('pvp_env.py', doraise=True\\); print\\('pvp_env.py OK'\\)\")"
+      "Bash(python -c \"import py_compile; py_compile.compile\\('pvp_env.py', doraise=True\\); print\\('pvp_env.py OK'\\)\")",
+      "Bash(python smoke_v7_run)",
+      "Bash(python /private/tmp/claude-501/-Users-jzhang-Documents-VSCode-RL-1-8-9-PVP/d9df6454-13e6-4e7e-8ce5-e721f2f6e3a7/scratchpad/smoke_v7.py)"
     ]
   }
 }

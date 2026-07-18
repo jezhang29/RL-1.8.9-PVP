@@ -32,9 +32,12 @@ from pvp_env import PvPEnv, OBS_DIM, ACTION_DIMS, KILL_REWARD, DEATH_REWARD
 from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
 
 # Simulated-latency range (ticks of action delay, ~50ms RTT each) for BOTH fighters,
-# resampled per round - see pvp_env.SIM_LAG_MS_PER_TICK. 0-4 covers LAN through
-# ~200ms, the range friends-over-internet actually shows up with.
-SIM_LAG_RANGE = (0, 4)
+# resampled per round - see pvp_env.SIM_LAG_MS_PER_TICK. Jul 18: 0-4 (~200ms) raised
+# to 0-6 (~300ms) - live fights showed the bot notably worse against real 150-300ms
+# opponents, i.e. exactly the band the old range barely sampled. Each fighter rolls
+# its own lag, so rounds also cover the asymmetric case (laggy them vs clean us and
+# vice versa), which is what a real high-ping opponent is.
+SIM_LAG_RANGE = (0, 6)
 
 # The server grants a freshly RESPAWNED player a few seconds of spawn-protection
 # invulnerability, which rigs every round's opening exchange: the previous round's
@@ -60,7 +63,15 @@ SPAWN_PROT_TICKS = 60
 # snapshot pool is the part that is a monoculture, not the scripts.
 SCRIPTED_PROB = 0.45
 SCRIPTED_STYLES = ("turtle", "rusher", "kiter", "boxer")
+# BASE weights only. Jul 18: live sampling is now ADAPTIVE (see style_weights in
+# main) - each base weight is scaled by (1.25 - recent winrate vs that style),
+# floored at 0.25x. A farmed style ("really weak preset") stops eating rounds it
+# produces no gradient in, an unbeaten one gets sampled harder, and the floor keeps
+# every style in rotation so a regression against a "solved" style is still caught.
 SCRIPTED_WEIGHTS = (2, 1, 1, 2)
+# Rounds of memory per style for the adaptive weighting; small enough to track the
+# learner's current state, big enough that one lucky round doesn't swing the weight.
+STYLE_HIST = 25
 
 # --- hyperparameters --------------------------------------------------------
 DEVICE = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -398,7 +409,22 @@ class ScriptedOpponent:
         elif self.style == "rusher":
             if tgt_hurt > self.prev_tgt_hurt:           # landed a hit -> W-tap
                 self.wtap = 2
-            move = 3 if self.wtap > 0 else 0            # drop sprint briefly, then re-engage
+            # Jul 18: the dead-straight approach made the rusher the weakest preset -
+            # a perfectly predictable closing line is trivially spaced/back-poked. Far
+            # out it now WEAVES in on a random-timer sprint-circle (still closing at
+            # sprint speed, W is held; the random flip is unmemorizable, same reasoning
+            # as the boxer's strafe timer); the last gap is closed straight so the
+            # weave never stops it from actually arriving.
+            self.strafe_left -= 1
+            if self.strafe_left <= 0:
+                self.strafe_dir = 1 if self.strafe_dir == 2 else 2
+                self.strafe_left = random.randint(8, 20)
+            if self.wtap > 0:
+                move = 3                                # drop sprint briefly, then re-engage
+            elif d > 4.0 or d <= 0.0:
+                move = self.strafe_dir                  # weaving sprint approach
+            else:
+                move = 0                                # commit the last gap straight
             self.wtap = max(0, self.wtap - 1)
             # Swing through the approach (same idea as combat.py's SWING_RANGE): a
             # whiff costs a rusher nothing and connects the instant reach is entered.
@@ -451,7 +477,14 @@ class ScriptedOpponent:
             elif d > 3.4 or d <= 0.0:
                 move = 0                                # sprint back onto the line
             else:
-                move = 4 if (self.tick // 8) % 2 == 0 else 5   # weave at max reach
+                # Weave at max reach on a RANDOM flip timer (Jul 18): the old fixed
+                # (tick // 8) phase was memorizable - the same exploit the boxer's
+                # strafe timer was built to close - and the kiter was getting farmed.
+                self.strafe_left -= 1
+                if self.strafe_left <= 0:
+                    self.strafe_dir = 1 if self.strafe_dir == 2 else 2
+                    self.strafe_left = random.randint(6, 16)
+                move = 4 if self.strafe_dir == 1 else 5
             click = int(swing and 0.0 < d <= 3.8)       # poke anything that crosses the line
             # A kiter's defense is SPACING, not block: blocking would drop it to sneak
             # speed and it could never hold the line, so it does NOT block (that would
@@ -799,12 +832,25 @@ def main():
         harness.set_opponent(opponent)
         harness.opp_tag = tag
 
+    # Adaptive scripted-style sampling (see SCRIPTED_WEIGHTS): rolling per-style
+    # result history, updated after every rollout. wr defaults to 0.5 until a style
+    # has a few rounds on record, so a fresh run starts at the base weights.
+    style_hist = {st: deque(maxlen=STYLE_HIST) for st in SCRIPTED_STYLES}
+
+    def style_weights():
+        ws = []
+        for st, base in zip(SCRIPTED_STYLES, SCRIPTED_WEIGHTS):
+            hist = style_hist[st]
+            wr = sum(hist) / len(hist) if len(hist) >= 8 else 0.5
+            ws.append(base * max(0.25, 1.25 - wr))
+        return ws
+
     def new_episode():
         # Sample a sparring partner: mostly past selves, but SCRIPTED_PROB of rounds
         # against a rule-driven personality (fresh instance each round so its little
         # bits of state - wtap timer, click phase - start clean).
         if random.random() < SCRIPTED_PROB:
-            style = random.choices(SCRIPTED_STYLES, weights=SCRIPTED_WEIGHTS)[0]
+            style = random.choices(SCRIPTED_STYLES, weights=style_weights())[0]
             harness.set_opponent(ScriptedOpponent(opp_env, style))
             harness.opp_tag = style
         else:
@@ -846,6 +892,12 @@ def main():
         harness.resync()
 
         if results:
+            # Feed the adaptive style sampler (kill=1, anything else=0: a timeout
+            # against a style is still "didn't beat it", which is what should keep
+            # its sampling weight up).
+            for r, _, t, _ in results:
+                if t in SCRIPTED_STYLES:
+                    style_hist[t].append(1.0 if r == "kill" else 0.0)
             wins = sum(1 for r, _, _, _ in results if r == "kill")
             timeouts = sum(1 for r, _, _, _ in results if r == "timeout")
             avg_r = np.mean([er for _, er, _, _ in results])
