@@ -4,7 +4,7 @@ import math
 # Both import from here so training and inference can never drift apart.
 
 STACK = 8          # ticks of history fed to the network (0.4s at 20Hz)
-FRAME_DIM = 29     # features per tick, see frame_features()
+FRAME_DIM = 48     # features per tick, see frame_features()
 INPUT_DIM = STACK * FRAME_DIM
 MAX_RANGE = 16.0   # blocks; beyond this the bot has no data and idles
 
@@ -136,4 +136,22 @@ def frame_features(obs):
         # v5 appended block: absolute health (see above), for lethal/crit decisions.
         my_health01,
         tgt_health01,
+        # v6 appended block: feet-above-ground height, both fighters, /4 (the mod's
+        # scan cap; jump apex ~1.25, knockback arcs higher). Distinguishes RISING
+        # (just jumped, height growing) from FALLING (crit window, can't redirect)
+        # when read across the 8-frame stack - on_ground alone can't. Absent (old
+        # jar/CSV) -> 0 = grounded = neutral, per the append-only convention.
+        clamp(max(obs.get("my_ground_h") or 0.0, 0.0) / 4.0),
+        clamp(max(obs.get("tgt_ground_h") or 0.0, 0.0) / 4.0),
+        # v7 appended block: radial wall map + jumpable step (needs the radial-scan
+        # jar; absent -> 0 = open, per convention). Eight wall-pressure lanes per
+        # fighter at 45-degree steps; lane 0 points AT the other fighter, so lanes
+        # are "toward them / flanks / my back", not compass axes. Lane 4 duplicates
+        # my_wall/tgt_wall (kept above for old checkpoints). This is the knockback
+        # terrain map: where each fighter CAN be launched, not just the one
+        # attacker-axis lane. my_step_up = a 1-block jumpable step toward them
+        # (also triggers the scripted hop in combat.py).
+        *[wall01("my_rwall_%d" % k) for k in range(8)],
+        *[wall01("tgt_rwall_%d" % k) for k in range(8)],
+        float(obs.get("my_step_up") or 0.0),
     ]

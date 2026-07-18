@@ -84,6 +84,13 @@ CRIT_HURT_HI = 8    # jump while target hurtTime is in [LO, HI] (counting down).
 CRIT_HURT_LO = 5
 CRIT_RANGE = 4.5    # ...and they're still close enough to chase the crit down
 CRIT_GAP = 12       # min ticks between crit jumps (one jump per i-frame cycle)
+# Step-up hop: the one OTHER profitable jump - vaulting a 1-block step between us
+# and the target (the mod's my_step_up: shin-height block ahead, headroom clear).
+# Without it a fighter W-holds into the ledge forever; the jump head is gone, so
+# terrain jumps must be scripted like the crit. Terrain locomotion, not combat
+# timing - so unlike blockhit/crit it applies to scripted opponents too (a style
+# stuck under a ledge is a degenerate curriculum, not a grounded-by-design one).
+STEP_GAP = 6        # min ticks between hops so a mis-read ledge can't pogo-lock
 
 
 TICK_MS = 50.0
@@ -203,8 +210,21 @@ class CombatController:
         if self._crit_jump(obs, dist):
             action["jump"] = True
             self.ticks_since_jump = 0
+        elif self._step_up_hop(obs, action):
+            action["jump"] = True
+            self.ticks_since_jump = 0
 
         return action
+
+    def _step_up_hop(self, obs, action):
+        """True when we're W-holding into a 1-block jumpable step toward the
+        target (see STEP_GAP comment): grounded, unhurt (a knockback flight is
+        not the moment to add air time), and moving forward into it."""
+        return (bool(obs.get("my_step_up"))
+                and action["w"]
+                and obs.get("on_ground", False)
+                and (obs.get("my_hurt", 0) or 0) == 0
+                and self.ticks_since_jump >= STEP_GAP)
 
     def _crit_jump(self, obs, dist):
         """True when a jump right now yields a falling crit as the target's damage
@@ -253,8 +273,9 @@ class CombatController:
         latch_block : True (the learner) gets the scripted post-hit blockhit reflex and
                    holds a chosen block for BLOCK_MIN_TICKS so the SERVER registers it.
                    False (scripted opponents) passes block through verbatim and gets NO
-                   reflexes - each style owns its own timing (and stays grounded by
-                   design), so injecting a blockhit/crit would corrupt the curriculum.
+                   combat reflexes - each style owns its own timing (and stays grounded
+                   in combat by design), so injecting a blockhit/crit would corrupt the
+                   curriculum. The terrain step-up hop is the exception (see STEP_GAP).
         """
         action = idle_action()
         action.update({k: bool(movement.get(k, False))
@@ -307,6 +328,11 @@ class CombatController:
         # window, right after our own hit - the one profitable jump in the fight. ---
         self.ticks_since_jump += 1
         if latch_block and self._crit_jump(obs, dist):
+            action["jump"] = True
+            self.ticks_since_jump = 0
+        # Step-up hop for EVERYONE, scripted styles included: it's terrain
+        # locomotion, not combat timing (see STEP_GAP comment).
+        elif self._step_up_hop(obs, action):
             action["jump"] = True
             self.ticks_since_jump = 0
 

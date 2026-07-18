@@ -146,8 +146,17 @@ def start_selfplay_bot(host='127.0.0.1', port=9999, ckpt='pvp_selfplay_best.pth'
 if __name__ == "__main__":
     # `python ai_server.py`            -> behavioral-cloning bot (default)
     # `python ai_server.py selfplay`   -> trained self-play policy (pvp_selfplay_best.pth)
-    if len(sys.argv) > 1 and sys.argv[1] == "selfplay":
-        ckpt = sys.argv[2] if len(sys.argv) > 2 else "pvp_selfplay_best.pth"
-        start_selfplay_bot(ckpt=ckpt)
+    # `--port 9998` anywhere -> serve that port instead of 9999. That's the offline
+    # "fight the trained bot yourself" setup: run the bot's client with
+    # -Dmlpvp.port=9998 and record your own client's rounds on 9999 separately.
+    args = list(sys.argv[1:])
+    port = 9999
+    if "--port" in args:
+        i = args.index("--port")
+        port = int(args[i + 1])
+        del args[i:i + 2]
+    if args and args[0] == "selfplay":
+        ckpt = args[1] if len(args) > 1 else "pvp_selfplay_best.pth"
+        start_selfplay_bot(port=port, ckpt=ckpt)
     else:
-        start_bc_bot()
+        start_bc_bot(port=port)
