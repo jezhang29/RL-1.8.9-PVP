@@ -4,7 +4,7 @@ import math
 # Both import from here so training and inference can never drift apart.
 
 STACK = 8          # ticks of history fed to the network (0.4s at 20Hz)
-FRAME_DIM = 48     # features per tick, see frame_features()
+FRAME_DIM = 52     # features per tick, see frame_features()
 INPUT_DIM = STACK * FRAME_DIM
 MAX_RANGE = 16.0   # blocks; beyond this the bot has no data and idles
 
@@ -154,4 +154,18 @@ def frame_features(obs):
         *[wall01("my_rwall_%d" % k) for k in range(8)],
         *[wall01("tgt_rwall_%d" % k) for k in range(8)],
         float(obs.get("my_step_up") or 0.0),
+        # v8 appended block: gear (Part 3, gear randomization). NOT mod telemetry -
+        # the trainer assigns each round's kit via /replaceitem and injects these
+        # keys Python-side (PvPEnv.gear_info), so no jar rebuild is needed. Armor in
+        # EFFECTIVE armor points /20 - vanilla points of the (mixed) set plus the
+        # Protection enchants folded into the same 4%-per-point currency (see
+        # train_selfplay._armor_kit), so heavy Prot can read slightly >1. Attack in
+        # final sword damage /7 incl. Sharpness (+1.25/level), likewise can exceed
+        # 1. Absent (old CSVs, BC live play, rounds before the first gear roll) ->
+        # 0 = "no info", per the append-only convention: remapped old checkpoints
+        # compute exactly what they did before.
+        clamp(max(obs.get("my_armor") or 0.0, 0.0) / 20.0),
+        clamp(max(obs.get("tgt_armor") or 0.0, 0.0) / 20.0),
+        clamp(max(obs.get("my_atk") or 0.0, 0.0) / 7.0),
+        clamp(max(obs.get("tgt_atk") or 0.0, 0.0) / 7.0),
     ]

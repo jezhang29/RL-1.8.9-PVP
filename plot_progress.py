@@ -71,7 +71,7 @@ function aggregate(rows) {
     if (!byU.has(r.update)) byU.set(r.update, []);
     byU.get(r.update).push(r);
   }
-  const SUM = new Set(['dealt', 'taken', 'hits', 'timeouts', 'rounds']);
+  const SUM = new Set(['dealt', 'taken', 'hits', 'timeouts', 'rounds', 'ties']);
   const out = [];
   for (const u of [...byU.keys()].sort((a, b) => a - b)) {
     const grp = byU.get(u);
@@ -80,7 +80,7 @@ function aggregate(rows) {
     for (const r of grp) for (const k of Object.keys(r)) keys.add(k);
     for (const k of keys) {
       if (k === 'update') continue;
-      if (k === 'max_combo') {
+      if (k === 'max_combo' || k === 'max_combo_taken') {
         let m = null;
         for (const r of grp) if (r[k] != null) m = m == null ? r[k] : Math.max(m, r[k]);
         rec[k] = m;
@@ -193,12 +193,22 @@ const CHARTS = [
     note: '(dealt − taken) / rounds. Positive and rising = winning exchanges, not just trading.',
     series: [ { name: 'net dmg/round', color: '#2ea36b', f: d => d.rounds ? (d.dealt - d.taken) / d.rounds : null } ],
     opts: { ref: 0 } },
-  { title: 'Combo length',
-    note: 'Clean-hit chain length per rollout. This is the readout of the clean-combo shaping — mean should drift up as chains hold.',
+  { title: 'Combo length — dealt vs taken',
+    note: 'Clean-hit chains landed (readout of the combo bonus — mean should drift up) vs unanswered chains TAKEN (readout of the Jul 18 combo-taken penalty — mean should drift DOWN as the bot learns to escape or answer back).',
     series: [
       { name: 'mean combo', color: '#d08b1f', f: d => d.mean_combo },
       { name: 'max combo', color: '#c0c0c0', f: d => d.max_combo, dashed: true },
+      { name: 'mean taken', color: '#e0483e', f: d => d.mean_combo_taken },
+      { name: 'max taken', color: '#8a5a5a', f: d => d.max_combo_taken, dashed: true },
     ] },
+  { title: 'Exchange quality',
+    note: 'first blood = share of rounds we land the opening hit. trade = share of our hits landed within 0.5s of taking one (trading, not comboing). block-eff = share of hits taken with block registered (damage halved). idle = uptake of the hitselect-release move (Part 1).',
+    series: [
+      { name: 'first blood %', color: '#2ea36b', f: d => d.first_blood },
+      { name: 'trade %', color: '#e0483e', f: d => d.trade_frac },
+      { name: 'block-eff %', color: '#9b59b6', f: d => d.blk_eff },
+      { name: 'idle-move %', color: '#3d8bff', f: d => d.idle_frac },
+    ], opts: { pct: true, y0: 0, y1: 1, ref: 0.5 } },
   { title: 'Style dials',
     note: 'Fraction of ticks holding block / swinging / jumping, in-range clicks that miss, and the share of the single most-used movement key-combo (11% = uniform over 9 moves, near 100% = movement collapse).',
     series: [
@@ -215,6 +225,7 @@ const CHARTS = [
       { name: 'rusher', color: '#e0483e', f: d => d.wr_rusher },
       { name: 'kiter', color: '#3d8bff', f: d => d.wr_kiter },
       { name: 'boxer', color: '#d08b1f', f: d => d.wr_boxer },
+      { name: 'trader', color: '#9b59b6', f: d => d.wr_trader },
     ], opts: { pct: true, y0: 0, y1: 1, ref: 0.5 } },
   { title: 'Exploration — policy entropy (nats)',
     note: '"Is it still trying new things?" Uniform ceilings: move ln(9)≈2.20, click/block/jump ln(2)≈0.69. Drifting down = converging (fine if winrate rises); a head near 0 has stopped exploring entirely.',
