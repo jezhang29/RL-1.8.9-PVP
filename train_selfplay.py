@@ -28,7 +28,8 @@ import torch.nn as nn
 from torch.distributions import Categorical, Normal
 
 from features import frame_features
-from pvp_env import PvPEnv, OBS_DIM, ACTION_DIMS, KILL_REWARD, DEATH_REWARD
+from pvp_env import (PvPEnv, OBS_DIM, ACTION_DIMS, KILL_REWARD, DEATH_REWARD,
+                     TIE_REWARD, IDLE_MOVE)
 from train_model import PvPCloner, adapt_ckpt_frame_dim, adapt_ckpt_move_dim
 
 # Simulated-latency range (ticks of action delay, ~50ms RTT each) for BOTH fighters,
@@ -62,13 +63,17 @@ SPAWN_PROT_TICKS = 60
 # pressure and is weighted with the turtle; prob raised 0.35 -> 0.45 because the
 # snapshot pool is the part that is a monoculture, not the scripts.
 SCRIPTED_PROB = 0.45
-SCRIPTED_STYLES = ("turtle", "rusher", "kiter", "boxer")
+# Jul 18 eve: added the TRADER - a scripted hitselection user (release-all when hit,
+# re-press W at the knockback-arc peak) - because the whole current goal is winning
+# trades via that family and no opponent demonstrated it. The boxer also gained the
+# same hitselect reflex (a competent human boxer hitselects too).
+SCRIPTED_STYLES = ("turtle", "rusher", "kiter", "boxer", "trader")
 # BASE weights only. Jul 18: live sampling is now ADAPTIVE (see style_weights in
 # main) - each base weight is scaled by (1.25 - recent winrate vs that style),
 # floored at 0.25x. A farmed style ("really weak preset") stops eating rounds it
 # produces no gradient in, an unbeaten one gets sampled harder, and the floor keeps
 # every style in rotation so a regression against a "solved" style is still caught.
-SCRIPTED_WEIGHTS = (2, 1, 1, 2)
+SCRIPTED_WEIGHTS = (2, 1, 1, 2, 2)
 # Rounds of memory per style for the adaptive weighting; small enough to track the
 # learner's current state, big enough that one lucky round doesn't swing the weight.
 STYLE_HIST = 25
@@ -101,7 +106,7 @@ OPPONENT_PORT = 9998
 # One row per update, appended across restarts (resumed runs keep extending the same
 # file). plot_progress.py turns this into the over-time graph. Header written once.
 METRICS_CSV = "selfplay_metrics.csv"
-METRICS_HEADER = ["update", "rounds", "timeouts", "winrate", "wr_old", "wr_new",
+METRICS_HEADER = ["update", "lifetime", "rounds", "timeouts", "winrate", "wr_old", "wr_new",
                   "wr_script", "wr_pin", "dealt", "taken", "hits", "mean_combo", "max_combo",
                   "blk", "clk", "jmp", "whiff", "aim_bias", "avg_reward",
                   "ploss", "vloss", "staleness",
@@ -115,7 +120,23 @@ METRICS_HEADER = ["update", "rounds", "timeouts", "winrate", "wr_old", "wr_new",
                   # (movement-collapse detector, 1/9 = uniform, ~1.0 = one key held).
                   "wr_turtle", "wr_rusher", "wr_kiter", "wr_boxer",
                   "ent_move", "ent_click", "ent_block", "ent_jump",
-                  "aim_std", "res_yaw", "res_pitch", "move_top", "move_top_frac"]
+                  "aim_std", "res_yaw", "res_pitch", "move_top", "move_top_frac",
+                  "wr_trader",   # appended Jul 18 eve (header-rewrite keeps old rows)
+                  # Jul 18 night: exchange telemetry. mean/max_combo_taken mirror
+                  # mean/max_combo (chain of UNANSWERED hits taken - the readout of the
+                  # new COMBO_TAKEN_PENALTY); first_blood = share of rounds we land the
+                  # opener; trade_frac = share of our hits landed within TRADE_WINDOW
+                  # of taking one; blk_eff = share of hits taken with block registered;
+                  # idle_frac = uptake of the idle/hitselect-release move (Part 1).
+                  "mean_combo_taken", "max_combo_taken", "first_blood",
+                  "trade_frac", "blk_eff", "idle_frac",
+                  # Mutual deaths (TIE_REWARD). Used to be scored +10 or -10 at random
+                  # depending on packet timing, so it never had a column.
+                  "ties",
+                  # Part 3 (gear randomization): winrate in rounds where the learner's
+                  # kit was strictly better / strictly worse than the opponent's
+                  # (roll_gear's edge). Even-gear rounds fall in neither.
+                  "wr_gear_up", "wr_gear_dn"]
 
 
 def append_metrics(row, path=METRICS_CSV):
@@ -176,9 +197,18 @@ PIN_SPAWNS = {
 
 
 def _effects():
-    return [f"/effect {n} {e} 1 {a}"
+    # 21=health_boost amp 4 (+20 HP -> 40 max), applied FIRST so instant_health
+    # fills the boosted pool. Rounds are the expensive part (respawn/teleport
+    # settle); exchanges are the data - doubling HP doubles the hitselection
+    # reps per round at the same reset overhead. Rounds run ~2x longer but stay
+    # far under max_ticks (timeouts were 0 at 20 HP). Feature normalization
+    # stays /20 on purpose: rescaling to /40 would shift every health feature
+    # under the loaded checkpoint's weights; values just extend to 2.0.
+    return [f"/effect {n} {e} {d} {a}"
             for n in (LEARNER_NAME, OPPONENT_NAME)
-            for e, a in ((6, 5), (23, 9))]   # 6=instant_health, 23=saturation
+            for e, d, a in ((21, 999, 4),   # health_boost, outlives any round
+                            (6, 1, 5),      # instant_health
+                            (23, 1, 9))]    # saturation
 
 
 def open_spawn():
@@ -206,6 +236,175 @@ def wall_pin_spawn(tag, pin_learner):
                      else (OPPONENT_NAME, LEARNER_NAME))
     return [f"/tp {pinned} {px} 65 {pz} {pyaw} 0",
             f"/tp {other} {ax} 65 {az} {ayaw} 0"] + _effects()
+
+
+# STEP_SPAWN_PROB of (non-pin) rounds start on the 1-block platform so the v7
+# terrain features (my_step_up, ground_h/height-diff at a real ledge) and the
+# scripted step-up hop actually see nonzero data - the flat floor never exercises
+# them. ONE-TIME WORLD EDIT REQUIRED first (opped, 1.8.9 syntax):
+#   /fill 5 65 9 8 65 12 stone
+# builds a 4x4, 1-high platform in the NE corner (top surface y=66 feet, against
+# the E/N walls so it also composes with the wall lanes). Set this to 0.0 if the
+# platform isn't built - a fighter tp'd to y=66 over bare floor just drops a block,
+# so nothing breaks, but the rounds teach nothing extra.
+STEP_SPAWN_PROB = 0.15
+
+
+def step_spawn(high_learner):
+    """One fighter on the platform edge, the other on the floor below: a live
+    1-block height mismatch. high_learner True -> the LEARNER holds the high
+    ground (defend the ledge / hop down for the knockback angle); False -> it
+    must close and hop UP to reach (the step-up reflex + the my_step_up
+    feature's moment). Jittered along the platform edge."""
+    j = random.randint(0, 2)
+    hx, hz = 6 + (j if j <= 1 else -1), 10          # on the platform, near its edge
+    lx, lz = 3 + random.randint(-1, 1), 6 + random.randint(-1, 1)   # floor, SW of it
+    high, low = ((LEARNER_NAME, OPPONENT_NAME) if high_learner
+                 else (OPPONENT_NAME, LEARNER_NAME))
+    return [f"/tp {high} {hx} 66 {hz} 135 0",
+            f"/tp {low} {lx} 65 {lz} 315 0"] + _effects()
+
+
+# --- Part 3: gear randomization ----------------------------------------------
+# Every round assigns BOTH fighters' kits explicitly via /replaceitem (1.8.9 has
+# it; needs op, same as /tp). Explicit every round on purpose: replaceitem'd items
+# persist across rounds, so "no commands" wouldn't mean "baseline kit", it would
+# mean "whatever last round left equipped". GEAR_RANDOM_PROB of rounds roll random
+# tiers; the rest fight in the fixed baseline so the core curriculum keeps its
+# exercise. The policy SEES gear via the injected v8 features (PvPEnv.gear_info -
+# my/tgt armor points and sword damage), which is what makes this a curriculum
+# ("I'm behind on gear - don't trade, make space / I'm ahead - force trades")
+# rather than unexplained reward noise. Tier MISMATCH between the fighters is
+# bounded (armor +-2 tiers, sword +-1): full-diamond vs naked is decided by the
+# spawn command, not by play, and rounds whose outcome the policy can't influence
+# only add variance to the winrate the snapshot gate and style weights read.
+GEAR_RANDOM_PROB = 0.5
+# Per-slot armor points, 1.8 values (helmet, chestplate, leggings, boots). Pieces
+# are rolled INDEPENDENTLY around a per-fighter quality center, so mixed sets
+# ("iron chest, leather boots") are the norm - a continuum of tankiness, not six
+# buckets. There is no "none" tier: unarmored fighters die in 4 hits and the round
+# is over before any technique matters, so the FLOOR is a full (mixed-)set.
+ARMOR_MATS = [("leather", (1, 3, 2, 1)), ("golden", (2, 5, 3, 1)),
+              ("chainmail", (2, 5, 4, 1)), ("iron", (2, 6, 5, 2)),
+              ("diamond", (3, 8, 6, 3))]
+# (item prefix, base attack damage). 1.8: gold=wood damage-wise, adds nothing.
+SWORD_TIERS = [("wooden", 4), ("stone", 5), ("iron", 6), ("diamond", 7)]
+# Enchantment rolls (1.8 numeric ids: Protection=0, Sharpness=16). Weighted toward
+# low levels; Sharpness adds a flat 1.25 damage per level in 1.8, which is what
+# makes the my_atk feature fractional instead of a 4-step ladder.
+PROT_LEVELS = (0, 0, 0, 1, 1, 2, 3)     # per PIECE
+SHARP_LEVELS = (0, 0, 1, 1, 2, 3)       # per sword
+SHARP_DMG = 1.25
+ARMOR_CENTER_MISMATCH = 1   # opp quality center within +-1 of the learner's
+SWORD_MISMATCH = 1
+# Baseline kit (the non-randomized half of rounds): FULL IRON + plain iron sword.
+# Deliberately armored - iron sword vs bare skin is 4 hits to a kill, so half the
+# early rounds were over before any spacing/trade behaviour could matter.
+BASELINE_ARMOR_TIER = 3   # iron
+BASELINE_SWORD = 2        # iron
+
+
+def _prot_epf(lvl):
+    """1.8 Protection enchantment protection factor: floor((6+lvl^2)*0.75/3)."""
+    return int((6 + lvl * lvl) * 0.75 / 3) if lvl > 0 else 0
+
+
+def _armor_kit(name, center, enchant=True):
+    """Roll one fighter's 4 armor pieces around a quality center (index into
+    ARMOR_MATS, each piece center+-1) with per-piece Protection. Returns
+    (commands, effective_armor_points): effective points fold the Protection
+    reduction into the same 4%-per-point currency as vanilla armor points -
+    expected total reduction = 1-(1-.04*pts)(1-prot), prot ~ 3% per EPF point
+    (4% x the 50-100% random roll's 75% mean, EPF sum capped at 25 as in 1.8) -
+    so the ONE feature the policy reads is honest about total tankiness."""
+    cmds, pts, epf = [], 0, 0
+    for i, (slot, piece) in enumerate((("head", "helmet"), ("chest", "chestplate"),
+                                       ("legs", "leggings"), ("feet", "boots"))):
+        tier = min(max(center + random.randint(-1, 1), 0), len(ARMOR_MATS) - 1) \
+            if enchant else center
+        mat, slot_pts = ARMOR_MATS[tier]
+        lvl = random.choice(PROT_LEVELS) if enchant else 0
+        nbt = f" {{ench:[{{id:0,lvl:{lvl}}}]}}" if lvl else ""
+        # No minecraft: prefix - the mod sends commands through client CHAT, and
+        # the 1.8 chat packet hard-truncates at 100 chars. The prefixed diamond
+        # chestplate + ench NBT was 103: the server saw unclosed brackets, kept
+        # last round's piece, and the gear features lied about it.
+        cmds.append(f"/replaceitem entity {name} slot.armor.{slot} "
+                    f"{mat}_{piece} 1 0{nbt}")
+        pts += slot_pts[i]
+        epf += _prot_epf(lvl)
+    prot_frac = 0.03 * min(epf, 25)
+    eff = (1.0 - (1.0 - 0.04 * pts) * (1.0 - prot_frac)) / 0.04
+    return cmds, eff
+
+
+def _sword_kit(name, si, sharp):
+    """(commands, final attack damage) for a sword of tier si with Sharpness."""
+    sword, dmg = SWORD_TIERS[si]
+    nbt = f" {{ench:[{{id:16,lvl:{sharp}}}]}}" if sharp else ""
+    # hotbar.0: the mod never scrolls the hotbar and a respawn re-selects slot 0,
+    # so slot 0 IS the held item.
+    return ([f"/replaceitem entity {name} slot.hotbar.0 {sword}_sword"
+             f" 1 0{nbt}"],
+            dmg + SHARP_DMG * sharp)
+
+
+# The mod relays commands via sendChatMessage; the 1.8 chat packet silently
+# truncates past 100 chars, which corrupts NBT mid-string ("unclosed brackets")
+# and leaves stale gear equipped. Fail loudly at build time instead.
+CHAT_LIMIT = 100
+
+
+def _chat_safe(cmds):
+    for c in cmds:
+        if len(c) > CHAT_LIMIT:
+            raise ValueError(f"command exceeds {CHAT_LIMIT}-char chat limit "
+                             f"({len(c)}): {c}")
+    return cmds
+
+
+def roll_gear():
+    """One round's kits. Returns (commands, learner_gear, opp_gear, edge):
+    the /replaceitem volley for both fighters, each side's gear_info dict (its OWN
+    perspective, in the v8 feature units: effective armor points incl. Protection,
+    final sword damage incl. Sharpness), and edge = +1/0/-1 for learner gear-
+    advantaged / even / disadvantaged (the wr_gear_up/dn split's key)."""
+    if random.random() < GEAR_RANDOM_PROB:
+        cl = random.randint(1, len(ARMOR_MATS) - 1)     # golden..diamond center
+        co = min(max(cl + random.randint(-ARMOR_CENTER_MISMATCH,
+                                         ARMOR_CENTER_MISMATCH), 1),
+                 len(ARMOR_MATS) - 1)
+        # Sword tier RIDES the armor center (cl 1..4 -> tier cl-1 or cl, i.e. a
+        # golden-kit fighter carries wood/stone, a diamond-kit one iron/diamond):
+        # independent rolls produced "full Prot-diamond vs wooden sword" rounds
+        # whose time-to-kill outruns max_ticks - all timeout, no gradient.
+        ls = min(cl - 1 + random.randint(0, 1), len(SWORD_TIERS) - 1)
+        os_ = min(max(ls + random.randint(-SWORD_MISMATCH, SWORD_MISMATCH), 0),
+                  len(SWORD_TIERS) - 1)
+        la_cmds, la_eff = _armor_kit(LEARNER_NAME, cl)
+        oa_cmds, oa_eff = _armor_kit(OPPONENT_NAME, co)
+        ls_cmds, l_atk = _sword_kit(LEARNER_NAME, ls, random.choice(SHARP_LEVELS))
+        os_cmds, o_atk = _sword_kit(OPPONENT_NAME, os_, random.choice(SHARP_LEVELS))
+    else:
+        la_cmds, la_eff = _armor_kit(LEARNER_NAME, BASELINE_ARMOR_TIER, enchant=False)
+        oa_cmds, oa_eff = _armor_kit(OPPONENT_NAME, BASELINE_ARMOR_TIER, enchant=False)
+        ls_cmds, l_atk = _sword_kit(LEARNER_NAME, BASELINE_SWORD, 0)
+        os_cmds, o_atk = _sword_kit(OPPONENT_NAME, BASELINE_SWORD, 0)
+    cmds = la_cmds + ls_cmds + oa_cmds + os_cmds
+    # Sweep death-dropped items (no keepInventory needed): every round re-issues
+    # full kits anyway, and without the sweep the arena floor accumulates loot
+    # entities all night.
+    cmds.append("/kill @e[type=Item]")
+    _chat_safe(cmds)
+    lg = {"my_armor": la_eff, "tgt_armor": oa_eff,
+          "my_atk": l_atk, "tgt_atk": o_atk}
+    og = {"my_armor": oa_eff, "tgt_armor": la_eff,
+          "my_atk": o_atk, "tgt_atk": l_atk}
+    adv = (la_eff - oa_eff) / 20.0 + (l_atk - o_atk) / 7.0
+    # Deadband: with per-piece rolls, exact ties are rare - a single Prot level of
+    # difference is not a real "edge", so near-even rounds count as even.
+    edge = 0 if abs(adv) < 0.05 else (1 if adv > 0 else -1)
+    return cmds, lg, og, edge
 
 
 # Constructor default (the very first reset, before new_episode picks per-round).
@@ -340,14 +539,23 @@ class ScriptedOpponent:
     Styles:
       turtle - the both-buttons-held human. Sprints in with the sword DOWN (blocking
                is sneak speed, so it can't chase blocked), then at trade range holds
-               block AND clicks (~10 CPS block-hitting: half damage in, full out). Wins
+               block AND clicks (window-gated block-hitting: half damage in, full out). Wins
                a sustained trade 2:1; the counter (don't stand and trade a blocker -
                block back, or make space and poke) is what the learner must discover.
-      rusher - sprint-in W-tapper, ~10 CPS, never blocks: punishes passivity and
+               Answers edge-farming by dropping the sword and sprint-chasing (see the
+               reclose branch) - without that it can literally never re-enter its own
+               reach against a retreating learner.
+      rusher - sprint-in W-tapper, never blocks: punishes passivity and
                makes PROACTIVE blocking actually pay during exchanges.
       kiter  - holds the spacing line by MOVEMENT alone: s-taps when crowded, sprints
                back onto the line when too far, weaves at max reach. Deliberately does
                NOT block - its defense is distance; blocking would kill its mobility.
+      trader - the hitselection specialist (the technique family the learner is
+               currently supposed to master): closes like the rusher, but the moment
+               it TAKES a hit it releases every key (idle) so the knockback carries it
+               cleanly out of follow-up range, then re-presses W at the arc peak -
+               controlled hit sequencing instead of fighting the knockback. Never
+               blocks: its trade defense IS the release timing.
     """
 
     def __init__(self, env, style):
@@ -365,13 +573,43 @@ class ScriptedOpponent:
         self.next_rush = random.randint(60, 120)   # ticks until the next burst
         self.strafe_dir = random.choice((1, 2))    # sprint circle-left / circle-right
         self.strafe_left = random.randint(8, 20)   # ticks until the direction flips
+        # hitselection state (trader always; boxer too): >0 = keys released, counting
+        # down the fail-safe; cleared early at the knockback-arc peak (my_vy <= 0)
+        self.hitsel = 0
+        self.prev_my_hurt = 0
+
+    def _hitselect(self, s):
+        """True while movement keys should stay RELEASED (classic hitselection).
+        Enter when a hit lands on us (my_hurt jumps); hold through the rising half
+        of the knockback arc; release at the peak (my_vy <= 0 - re-pressing W while
+        falling is exactly the guide's timing) or after a fail-safe 8 ticks."""
+        my_hurt = s.get("my_hurt") or 0
+        if my_hurt > self.prev_my_hurt:
+            self.hitsel = 8
+        self.prev_my_hurt = my_hurt
+        if self.hitsel > 0:
+            self.hitsel -= 1
+            if (s.get("my_vy") or 0.0) <= 0.0 and self.hitsel < 7:
+                self.hitsel = 0   # arc peak passed: back on the W key
+        return self.hitsel > 0
 
     def act(self, obs_np, greedy=False):
         s = self.env.last_state or {}
         self.tick += 1
         d = s.get("target_dist") or -1.0
         tgt_hurt = s.get("tgt_hurt") or 0
-        swing = self.tick % 2 == 0     # ~10 CPS for everyone
+        # Click gating (Jul 18 night): swing on any tick the target's damage window is
+        # OPEN (hurtTime 0), not on a blind tick%2 ~10 CPS. i-frames cap real DPS, so
+        # the fixed phase only ever cost up to a tick of lag on each window opening -
+        # but every blind click also DROPPED THE BLOCK for its tick (release-to-hit,
+        # see act_policy), so the turtle's alternating click/block was a string of
+        # 1-tick block blips that never held BLOCK_MIN_TICKS consecutively and NEVER
+        # REGISTERED server-side. The style whose whole identity is "wins trades 2:1
+        # behind a block" was taking full damage the entire run - which is why it
+        # kept getting comboed and never won a round. Window gating pauses clicking
+        # for the 10 ticks after every landed hit, so the sword stays up between
+        # swings and the block actually registers: real blockhitting.
+        window = tgt_hurt == 0
         move, click, block = 0, 0, 0
         if self.style == "turtle":
             # Gate on the THREAT band (learner reach ~3.4 + lead/knockback slop), not
@@ -379,9 +617,8 @@ class ScriptedOpponent:
             # block and stopped clicking exactly while the learner's edge-of-reach
             # follow-ups landed - it read as a punching bag that only swings once it's
             # already being hit. Inside the band it is the both-buttons-held human:
-            # walk in, block up, ~10 CPS (whiffed clicks are free in 1.8, so the hit
-            # lands the first tick reach is entered; block-hitting = half damage in,
-            # full out). Outside it, sprint sword-down to close (can't chase at sneak
+            # walk in, block up, click when the window opens (block-hitting = half
+            # damage in, full out). Outside it, sprint sword-down to close (can't chase at sneak
             # speed - that mobility tradeoff is the style's real weakness, on purpose).
             # The threat band alone got FARMED once the learner found the counter:
             # sit at ~3.4 (just past the turtle's ~3 reach), poke, and let sneak
@@ -398,12 +635,26 @@ class ScriptedOpponent:
             elif 0.0 < d <= 4.25:
                 self.starved += 1                       # blocking but can't reach
             if self.reclose > 0:
-                self.reclose -= 1                       # sprint-burst: block down
-                move, click = 0, int(swing and 0.0 < d <= 4.5)
+                # Chase: sword DOWN and sprinting, the only state in which a turtle can
+                # actually gain ground (right_click forces sprint off, so a blocking
+                # turtle closes at ~1.6 m/s against a 4.3 m/s walking retreat - it can
+                # NEVER catch up while the sword is up). Sprint 5.6 vs walk 4.3 closes
+                # ~0.065 blocks/tick, so the old 6-tick burst bought 0.4 blocks - pure
+                # theatre. 16 ticks buys ~1 block, enough to actually re-enter reach.
+                # Ends early the moment we're comfortably inside reach: run them down,
+                # then put the sword back up.
+                self.reclose -= 1
+                move, click = 0, int(window and 0.0 < d <= 4.5)
+                if 0.0 < d <= 2.8:
+                    self.reclose = 0
             elif 0.0 < d <= 4.25:
-                move, block, click = 3, 1, int(swing)
-                if self.starved > 8:                    # edge-farmed: force the gap shut
-                    self.reclose, self.starved = 6, 0
+                # Click only inside OWN reach (~3): the old int(swing) clicked through
+                # the whole 4.25 band, so edge-of-reach whiffs dropped the block on
+                # alternating ticks for nothing - the worst of both buttons. Out of
+                # reach the sword just stays up.
+                move, block, click = 3, 1, int(window and 0.0 < d <= 3.0)
+                if self.starved > 5:                    # edge-farmed: force the gap shut
+                    self.reclose, self.starved = 16, 0
             else:
                 move = 0                                # sprint in, sword down
         elif self.style == "rusher":
@@ -428,7 +679,7 @@ class ScriptedOpponent:
             self.wtap = max(0, self.wtap - 1)
             # Swing through the approach (same idea as combat.py's SWING_RANGE): a
             # whiff costs a rusher nothing and connects the instant reach is entered.
-            click = int(swing and 0.0 < d <= 4.5)
+            click = int(window and 0.0 < d <= 4.5)
         elif self.style == "boxer":
             # The closest scripted approximation of a competent human, added when the
             # first three styles were fully farmed (wr_script ~86%, half of updates at
@@ -437,9 +688,11 @@ class ScriptedOpponent:
             # (tick//8) weave phase is memorizable; a random timer is not), W-tap after
             # landing a hit, a short block-hit after TAKING one (proactive, through the
             # follow-up window), s-taps when crowded, and irregular sprint-in bursts so
-            # its spacing rhythm can't be locked onto. Never jumps: staying grounded is
-            # also what punishes a hop-spamming learner (airborne targets take full
-            # knockback and lose sprint).
+            # its spacing rhythm can't be locked onto. Never jumps of its own accord -
+            # staying grounded is what punishes a hop-spamming learner (airborne targets
+            # take full knockback and lose sprint). The post-hit crit reflex is the one
+            # exception (Jul 18 night), and it fires only inside the victim's i-frame
+            # window, which is precisely when being airborne costs nothing.
             my_h = s.get("my_health")
             took_hit = (my_h is not None and self.prev_my_h is not None
                         and my_h < self.prev_my_h)
@@ -467,10 +720,42 @@ class ScriptedOpponent:
             else:
                 move = self.strafe_dir           # circle at reach
             block = int(self.block_hold > 0 and 0.0 < d <= 4.0)
-            click = int(swing and 0.0 < d <= (4.5 if self.rush > 0 else 3.6))
+            # No clicking through the block-hold: the hold is a deliberate 6-tick
+            # defensive beat, and a click in the middle of it releases the block for
+            # that tick, breaking the consecutive hold the server needs to register
+            # it (the same bug that gutted the turtle). Counter AFTER the hold.
+            click = int(window and self.block_hold <= 0
+                        and 0.0 < d <= (4.5 if self.rush > 0 else 3.6))
             self.wtap = max(0, self.wtap - 1)
             self.rush = max(0, self.rush - 1)
             self.block_hold = max(0, self.block_hold - 1)
+            # Jul 18 eve: the boxer hitselects too (movement release only - its
+            # block-hit timing above is untouched). Not during an aggression burst:
+            # a rush is a deliberate "eat a hit to land two" commitment.
+            if self._hitselect(s) and self.rush <= 0:
+                move = 9
+        elif self.style == "trader":
+            # Hitselection FIRST: taking a hit overrides everything - release all
+            # keys so the knockback carries us out clean, W again at the arc peak.
+            hitsel = self._hitselect(s)
+            if tgt_hurt > self.prev_tgt_hurt:
+                self.wtap = 2                       # sprint-reset the landed hit
+            self.strafe_left -= 1
+            if self.strafe_left <= 0:
+                self.strafe_dir = 1 if self.strafe_dir == 2 else 2
+                self.strafe_left = random.randint(8, 20)
+            if hitsel:
+                move = 9                            # all keys released, ride the arc
+            elif self.wtap > 0:
+                move = 3                            # W-tap: drop sprint, keep closing
+            elif d > 4.0 or d <= 0.0:
+                move = self.strafe_dir              # weaving sprint approach (rusher's)
+            else:
+                move = 0                            # commit the last gap straight
+            self.wtap = max(0, self.wtap - 1)
+            # Keep clicking even mid-hitselect: the release is a MOVEMENT technique;
+            # the point of winning trades is that the hits keep coming.
+            click = int(window and 0.0 < d <= 4.5)
         else:  # kiter
             if 0.0 < d < 2.6:
                 move = 8                                # s-tap: kill closing momentum
@@ -485,14 +770,18 @@ class ScriptedOpponent:
                     self.strafe_dir = 1 if self.strafe_dir == 2 else 2
                     self.strafe_left = random.randint(6, 16)
                 move = 4 if self.strafe_dir == 1 else 5
-            click = int(swing and 0.0 < d <= 3.8)       # poke anything that crosses the line
+            click = int(window and 0.0 < d <= 3.8)      # poke anything that crosses the line
             # A kiter's defense is SPACING, not block: blocking would drop it to sneak
             # speed and it could never hold the line, so it does NOT block (that would
             # make it a slow turtle). Blocking is the turtle's job.
         self.prev_tgt_hurt = tgt_hurt
         action = {"move": move, "click": click, "block": block,
                   "aim": np.zeros(ACTION_DIMS["aim"], dtype=np.float32),
-                  "latch_block": False}   # scripted styles own their own block timing
+                  "latch_block": False,   # scripted styles own their own block timing
+                  # ...but they DO crit (Jul 18 night). This was learner-only, which is
+                  # why every style was unwinnable rather than merely farmed: see the
+                  # crit_jump note in combat.act_policy.
+                  "crit_jump": True}
         return action, 0.0, 0.0
 
 
@@ -572,8 +861,8 @@ class SelfPlayHarness:
         # the zero-health frame entirely. When only the OPPONENT env saw the
         # terminal, credit the learner now; without this, those rounds pay no
         # KILL/DEATH reward and fall out of the winrate as result "?".
+        opp_result = opp_info.get("result")
         if opp_done and not done:
-            opp_result = opp_info.get("result")
             if opp_result == "death":       # opponent died -> we killed it
                 info["result"] = "kill"
                 reward += KILL_REWARD
@@ -582,6 +871,23 @@ class SelfPlayHarness:
                 reward += DEATH_REWARD
             else:
                 info.setdefault("result", opp_result or "timeout")
+        elif done and opp_done and info.get("result") != "tie":
+            # Both clients hit a terminal on the same tick. Each env only knows what
+            # ITS client saw, so cross-check them: two "kill"s means each fighter saw
+            # the OTHER die - a mutual death, not a win. Likewise two "death"s means
+            # each saw its own. Consistent pairs (kill/death) are a genuine clean
+            # result and are left alone.
+            # This is the case that used to be a coin flip: the learner env's own
+            # verdict simply won, so the identical mutual death scored +10 or -10
+            # depending on which health packet arrived first. Now it is one outcome.
+            my_result = info.get("result")
+            if (my_result == "kill" and opp_result == "kill") or \
+               (my_result == "death" and opp_result == "death"):
+                # Undo the terminal bonus the learner's env already applied, then
+                # score the tie once.
+                reward -= KILL_REWARD if my_result == "kill" else DEATH_REWARD
+                reward += TIE_REWARD
+                info["result"] = "tie"
         return obs, reward, done or opp_done, info
 
     def resync(self):
@@ -676,6 +982,10 @@ def collect_rollout(harness, model, n_steps, state):
     ep_reward, ep_results = state.get("ep_reward", 0.0), []
     total_dealt = total_taken = 0.0
     combo_at_hit = []   # chain length on each tick a hit lands (see info["combo"])
+    combo_taken_at_hit = []  # unanswered-chain length on each tick a hit is TAKEN
+    first_bloods = []   # +1 we landed the opener / -1 we ate it, one per resolved round
+    trade_hits = 0      # our landed hits that came within TRADE_WINDOW of taking one
+    taken_hits = blocked_hits = 0  # hits taken / of those, taken with block registered
     stale_vals = []     # mod-reported control-loop lag (healthy 1, spin-phase 2)
     whiffs = click_evals = 0   # in-range clicks whose crosshair ray missed / total
     yaw_errs = []       # signed combat-range yaw error; mean < 0 = crosshair sits right
@@ -688,6 +998,15 @@ def collect_rollout(harness, model, n_steps, state):
         total_taken += info.get("taken", 0.0)
         if info.get("dealt", 0.0) > 0.0:
             combo_at_hit.append(info.get("combo", 0))
+            if info.get("trade"):
+                trade_hits += 1
+        if info.get("taken", 0.0) > 0.0:
+            taken_hits += 1
+            combo_taken_at_hit.append(info.get("combo_taken", 0))
+            if info.get("blocked_hit"):
+                blocked_hits += 1
+        if info.get("first_blood"):
+            first_bloods.append(info["first_blood"])
         st = info.get("staleness", -1)
         if st is not None and st > 0:
             stale_vals.append(st)
@@ -715,7 +1034,8 @@ def collect_rollout(harness, model, n_steps, state):
             tag = ("human" if getattr(harness, "opp_human", False)
                    else getattr(harness, "opp_tag", "?"))
             ep_results.append((info.get("result", "?"), ep_reward, tag,
-                               getattr(harness, "pinned", False)))
+                               getattr(harness, "pinned", False),
+                               getattr(harness, "gear_edge", 0)))
             ep_reward = 0.0
             # New round: resample opponent from the pool happens in the caller
             obs = state["on_episode_end"]()
@@ -739,6 +1059,15 @@ def collect_rollout(harness, model, n_steps, state):
         "hits": len(combo_at_hit),
         "mean_combo": float(np.mean(combo_at_hit)) if combo_at_hit else 0.0,
         "max_combo": max(combo_at_hit) if combo_at_hit else 0,
+        "mean_combo_taken": (float(np.mean(combo_taken_at_hit))
+                             if combo_taken_at_hit else 0.0),
+        "max_combo_taken": max(combo_taken_at_hit) if combo_taken_at_hit else 0,
+        # Share of resolved opening-hit races we won; nan if no round opened this
+        # rollout. trade_frac's denominator is OUR landed hits; blk_eff's is hits taken.
+        "first_blood": (float(np.mean([fb > 0 for fb in first_bloods]))
+                        if first_bloods else float("nan")),
+        "trade_frac": trade_hits / max(len(combo_at_hit), 1),
+        "blk_eff": blocked_hits / max(taken_hits, 1),
         "staleness": float(np.mean(stale_vals)) if stale_vals else float("nan"),
         "whiff": whiffs / max(click_evals, 1),
         "aim_bias": float(np.mean(yaw_errs)) if yaw_errs else float("nan"),
@@ -768,10 +1097,34 @@ def main():
         was removed when crit-jump became a scripted reflex, so every checkpoint on disk
         (BC clone, best, latest, pool snapshots) still carries it. The remaining keys
         (base + move/click/block/aim/critic) match the current jumpless model exactly."""
+        raw = torch.load(path, map_location=DEVICE)
+        # Checkpoints are now saved as {"state_dict":..., "lifetime":...} so the
+        # cumulative update count survives restarts; every file written before that
+        # change is a bare state_dict. Accept both - unwrapping here keeps the
+        # pool-seeding and resume callers identical for old and new files.
+        if isinstance(raw, dict) and "state_dict" in raw:
+            raw = raw["state_dict"]
         sd = adapt_ckpt_move_dim(
-            adapt_ckpt_frame_dim(torch.load(path, map_location=DEVICE)),
-            ACTION_DIMS["move"])
+            adapt_ckpt_frame_dim(raw), ACTION_DIMS["move"])
         return {k: v for k, v in sd.items() if not k.startswith("jump_head")}
+
+    def load_lifetime(path):
+        """Cumulative updates recorded in a checkpoint (0 for pre-change files)."""
+        try:
+            raw = torch.load(path, map_location="cpu")
+        except FileNotFoundError:
+            return 0
+        if isinstance(raw, dict) and "lifetime" in raw:
+            return int(raw["lifetime"])
+        # Pre-change checkpoint: it carries no counter, but the metrics CSV has
+        # appended one row per update since the first run, so its row count IS the
+        # history. Used only to seed the odometer once; afterwards the checkpoint
+        # is authoritative.
+        try:
+            with open(METRICS_CSV, newline="") as f:
+                return sum(1 for _ in csv.DictReader(f))
+        except FileNotFoundError:
+            return 0
 
     # Startup priority: resume a live run > start from the cloned policy > fall back to
     # the trunk-only BC floor. Resuming keeps a run going across reward tweaks and
@@ -781,9 +1134,14 @@ def main():
     # no-block corner. (Jump is scripted, not cloned; a pre-removal bc.pth still loads -
     # load_adapted drops its jump_head.) warm_start_from_bc above already seeded the
     # trunk, so if neither checkpoint exists we still start there.
+    # Updates completed by every PRIOR run, carried in the checkpoint. `update` below
+    # still restarts at 1 each run (it paces snapshots and the log-every-N cadence);
+    # this is the odometer that doesn't reset.
+    lifetime_base = 0
     try:
         model.load_state_dict(load_adapted("pvp_selfplay_latest.pth"))
-        print("Resumed from pvp_selfplay_latest.pth")
+        lifetime_base = load_lifetime("pvp_selfplay_latest.pth")
+        print(f"Resumed from pvp_selfplay_latest.pth (lifetime updates: {lifetime_base})")
     except FileNotFoundError:
         try:
             model.load_state_dict(load_adapted("pvp_selfplay_bc.pth"))
@@ -863,7 +1221,17 @@ def main():
         # LEARNER against a rusher so it practices fighting out of a corner; else
         # coin-flip. Assign learner_env.reset_commands (opp_env issues none); PvPEnv
         # calls it each reset.
-        if random.random() < WALL_PIN_PROB:
+        # Gear for the round (Part 3): the /replaceitem volley rides the same reset
+        # command list as the teleport (so the respawn double-volley re-equips a
+        # freshly dead fighter too), and each env gets its own-perspective gear_info
+        # BEFORE the reset so every frame of the round carries the v8 features.
+        gear_cmds, lg, og, gear_edge = roll_gear()
+        learner_env.gear_info = lg
+        opp_env.gear_info = og
+        harness.gear_edge = gear_edge
+
+        roll = random.random()
+        if roll < WALL_PIN_PROB:
             tag = random.choice(list(PIN_SPAWNS))
             if style == "turtle":
                 pin_learner = False
@@ -871,10 +1239,16 @@ def main():
                 pin_learner = True
             else:
                 pin_learner = random.random() < 0.5
-            learner_env.reset_commands = lambda t=tag, p=pin_learner: wall_pin_spawn(t, p)
+            learner_env.reset_commands = (
+                lambda t=tag, p=pin_learner, g=gear_cmds: wall_pin_spawn(t, p) + g)
             harness.pinned = True
+        elif roll < WALL_PIN_PROB + STEP_SPAWN_PROB:
+            # Terrain round: 1-block height mismatch at the platform (see step_spawn).
+            hl = random.random() < 0.5
+            learner_env.reset_commands = lambda h=hl, g=gear_cmds: step_spawn(h) + g
+            harness.pinned = False
         else:
-            learner_env.reset_commands = open_spawn
+            learner_env.reset_commands = lambda g=gear_cmds: open_spawn() + g
             harness.pinned = False
         return harness.reset()
 
@@ -895,24 +1269,31 @@ def main():
             # Feed the adaptive style sampler (kill=1, anything else=0: a timeout
             # against a style is still "didn't beat it", which is what should keep
             # its sampling weight up).
-            for r, _, t, _ in results:
+            for r, _, t, _, _ in results:
                 if t in SCRIPTED_STYLES:
                     style_hist[t].append(1.0 if r == "kill" else 0.0)
-            wins = sum(1 for r, _, _, _ in results if r == "kill")
-            timeouts = sum(1 for r, _, _, _ in results if r == "timeout")
-            avg_r = np.mean([er for _, er, _, _ in results])
+            wins = sum(1 for r, _, _, _, _ in results if r == "kill")
+            timeouts = sum(1 for r, _, _, _, _ in results if r == "timeout")
+            ties = sum(1 for r, _, _, _, _ in results if r == "tie")
+            avg_r = np.mean([er for _, er, _, _, _ in results])
             # Winrate split by opponent age: the pool is ordered oldest->newest, so
             # beating the older half >50% while staying ~50% vs the newer half is
             # the signature of real improvement (both sides of a mirror can't beat
             # each other, but the present should beat the past).
             tag_order = [t for t, _ in pool]
             half = len(tag_order) / 2.0
-            old_res = [r for r, _, t, _ in results
+            old_res = [r for r, _, t, _, _ in results
                        if t in tag_order and tag_order.index(t) < half]
-            new_res = [r for r, _, t, _ in results
+            new_res = [r for r, _, t, _, _ in results
                        if t in tag_order and tag_order.index(t) >= half]
-            scr_res = [r for r, _, t, _ in results if t in SCRIPTED_STYLES]
-            pin_res = [r for r, _, _, p in results if p]
+            scr_res = [r for r, _, t, _, _ in results if t in SCRIPTED_STYLES]
+            pin_res = [r for r, _, _, p, _ in results if p]
+            # Gear splits (Part 3): rounds where the learner's kit was strictly
+            # better / strictly worse than the opponent's. wr_gear_dn is the one to
+            # watch - "can it survive from behind on gear" - and the two should
+            # bracket the even-gear winrate once the features are being read.
+            gear_up = [r for r, _, _, _, g in results if g > 0]
+            gear_dn = [r for r, _, _, _, g in results if g < 0]
             def wr(rs):
                 return (f"{sum(1 for r in rs if r == 'kill')/len(rs):4.0%}"
                         if rs else "  - ")
@@ -940,9 +1321,12 @@ def main():
             mv_counts = np.bincount(batch["move"], minlength=ACTION_DIMS["move"])
             move_top = int(mv_counts.argmax())
             move_top_frac = float(mv_counts.max() / max(mv_counts.sum(), 1))
-            per_style = {st: wr_num([r for r, _, t, _ in results if t == st])
+            # Uptake of the idle/hitselect-release primitive (Part 1) - the direct
+            # answer to "is the new action being used at all".
+            idle_frac = float(mv_counts[IDLE_MOVE] / max(mv_counts.sum(), 1))
+            per_style = {st: wr_num([r for r, _, t, _, _ in results if t == st])
                          for st in SCRIPTED_STYLES}
-            print(f"upd {update:4d} | rounds {len(results):3d} ({timeouts} tmo) | "
+            print(f"upd {update:4d} | rounds {len(results):3d} ({timeouts} tmo, {ties} tie) | "
                   f"winrate {wins/len(results):4.0%} (old {wr(old_res)} new {wr(new_res)} "
                   f"scr {wr(scr_res)} pin {wr(pin_res)}) | "
                   f"dmg +{dmg['dealt']:3.0f}/-{dmg['taken']:3.0f} | "
@@ -951,18 +1335,27 @@ def main():
                   f"res {res_yaw:+4.1f} | ent {ent_move:.2f} | "
                   f"avg reward {avg_r:+6.2f} | ploss {p_loss:+.3f} vloss {v_loss:.3f} | "
                   f"lat {dmg['staleness']:.2f}")
+            # Exchange telemetry: cT = mean/max chain of UNANSWERED hits taken (the
+            # combo-taken shaping readout), fb = opening-hit races won, trade = our
+            # hits landed within 0.5s of taking one, blkeff = hits taken while
+            # blocking, idle = hitselect-release move uptake.
+            print(f"           cT {dmg['mean_combo_taken']:.1f}/{dmg['max_combo_taken']} | "
+                  f"fb {dmg['first_blood']:4.0%} | trade {dmg['trade_frac']:4.0%} | "
+                  f"blkeff {dmg['blk_eff']:4.0%} | idle {idle_frac:4.0%} | "
+                  f"gear up {wr(gear_up)} dn {wr(gear_dn)}")
             # Per-opponent W-L (kills-deaths from the LEARNER's side), so a single
             # dominant sparring partner is identifiable by tag instead of showing
             # up only as an anonymous dip in the aggregate winrate.
             by_tag = {}
-            for r, _, t, _ in results:
+            for r, _, t, _, _ in results:
                 by_tag.setdefault(t, []).append(r)
             print("           vs " + "  ".join(
                 f"{t} {sum(1 for r in rs if r == 'kill')}-"
                 f"{sum(1 for r in rs if r == 'death')}"
                 for t, rs in sorted(by_tag.items())))
             append_metrics({
-                "update": update, "rounds": len(results), "timeouts": timeouts,
+                "update": update, "lifetime": lifetime_base + update,
+                "rounds": len(results), "timeouts": timeouts, "ties": ties,
                 "winrate": wins / len(results),
                 "wr_old": wr_num(old_res), "wr_new": wr_num(new_res),
                 "wr_script": wr_num(scr_res), "wr_pin": wr_num(pin_res),
@@ -974,10 +1367,17 @@ def main():
                 "ploss": p_loss, "vloss": v_loss, "staleness": dmg["staleness"],
                 "wr_turtle": per_style["turtle"], "wr_rusher": per_style["rusher"],
                 "wr_kiter": per_style["kiter"], "wr_boxer": per_style["boxer"],
+                "wr_trader": per_style["trader"],
                 "ent_move": ent_move, "ent_click": ent_click,
                 "ent_block": ent_block, "ent_jump": ent_jump,
                 "aim_std": aim_std, "res_yaw": res_yaw, "res_pitch": res_pitch,
                 "move_top": move_top, "move_top_frac": move_top_frac,
+                "mean_combo_taken": dmg["mean_combo_taken"],
+                "max_combo_taken": dmg["max_combo_taken"],
+                "first_blood": dmg["first_blood"],
+                "trade_frac": dmg["trade_frac"], "blk_eff": dmg["blk_eff"],
+                "idle_frac": idle_frac,
+                "wr_gear_up": wr_num(gear_up), "wr_gear_dn": wr_num(gear_dn),
             })
             recent_avg.append(avg_r)
             # Divergence firewall. With the reward now bounded (pvp_env REWARD_CLIP) a
@@ -994,14 +1394,16 @@ def main():
             # Snapshot gate counts SNAPSHOT rounds only: early losses to the scripted
             # styles (expected - the turtle beats today's policy by design) must not
             # freeze pool growth, which is gated on beating one's own past.
-            pool_res = [r for r, _, t, _ in results if t in tag_order]
+            pool_res = [r for r, _, t, _, _ in results if t in tag_order]
             snap_wins += sum(1 for r in pool_res if r == "kill")
             snap_rounds += len(pool_res)
             if len(recent_avg) == recent_avg.maxlen:
                 smoothed = float(np.mean(recent_avg))
                 if smoothed > best_avg:
                     best_avg = smoothed
-                    torch.save(model.state_dict(), "pvp_selfplay_best.pth")
+                    torch.save({"state_dict": model.state_dict(),
+                                "lifetime": lifetime_base + update},
+                               "pvp_selfplay_best.pth")
 
         if update % SNAPSHOT_EVERY == 0:
             # Gate pool entry on winrate since the last snapshot: a degrading policy
@@ -1018,12 +1420,14 @@ def main():
                 # Timestamped because the update counter restarts at 1 every run.
                 os.makedirs("pool_snapshots", exist_ok=True)
                 snap_path = f"pool_snapshots/{time.strftime('%b%d_%H%M')}_u{update}.pth"
-                torch.save(model.state_dict(), snap_path)
+                torch.save({"state_dict": model.state_dict(),
+                            "lifetime": lifetime_base + update}, snap_path)
                 print(f"  snapshot added (pool size {len(pool)}) -> {snap_path}")
             else:
                 print(f"  snapshot SKIPPED (winrate {wr_since:.0%} since last < 45%)")
             snap_wins = snap_rounds = 0
-            torch.save(model.state_dict(), "pvp_selfplay_latest.pth")
+            torch.save({"state_dict": model.state_dict(),
+                        "lifetime": lifetime_base + update}, "pvp_selfplay_latest.pth")
 
     harness.close()
 

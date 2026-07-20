@@ -244,7 +244,8 @@ class CombatController:
                 and obs.get("on_ground", False)
                 and self.ticks_since_jump >= CRIT_GAP)
 
-    def act_policy(self, obs, movement, click, block, aim_res, latch_block=True):
+    def act_policy(self, obs, movement, click, block, aim_res, latch_block=True,
+                   crit_jump=True):
         """Self-play variant: the RL policy owns MOVEMENT, ATTACK, a defensive BLOCK
         posture and an aim residual. The mechanical, event-timed techniques stay
         COMPUTED - like aim - because their correct timing is a known function of an
@@ -272,10 +273,15 @@ class CombatController:
                    angle. Clamped to +-AIM_RES_MAX so the geometry stays the floor.
         latch_block : True (the learner) gets the scripted post-hit blockhit reflex and
                    holds a chosen block for BLOCK_MIN_TICKS so the SERVER registers it.
-                   False (scripted opponents) passes block through verbatim and gets NO
-                   combat reflexes - each style owns its own timing (and stays grounded
-                   in combat by design), so injecting a blockhit/crit would corrupt the
-                   curriculum. The terrain step-up hop is the exception (see STEP_GAP).
+                   False (scripted opponents) passes block through verbatim - each style
+                   owns its own block timing, so injecting a blockhit would corrupt the
+                   curriculum. Their sprint reset comes from the style itself instead
+                   (the rusher/trader/boxer W-tap; the turtle's block drops sprint).
+        crit_jump : whether the post-hit crit reflex fires. True for EVERYONE including
+                   scripted styles - unlike blocking, a crit is not a style choice but
+                   the baseline damage every competent 1.8 fighter does, and gating it
+                   on latch_block silently handicapped the whole curriculum. The
+                   terrain step-up hop is likewise universal (see STEP_GAP).
         """
         action = idle_action()
         action.update({k: bool(movement.get(k, False))
@@ -323,11 +329,18 @@ class CombatController:
         if action["right_click"]:
             action["sprint"] = False
 
-        # --- Crit-jump: scripted reflex, learner only (see _crit_jump / the docstring).
-        # The falling half of the jump must land inside the victim's reopening damage
-        # window, right after our own hit - the one profitable jump in the fight. ---
+        # --- Crit-jump: scripted reflex (see _crit_jump / the docstring). The falling
+        # half of the jump must land inside the victim's reopening damage window, right
+        # after our own hit - the one profitable jump in the fight.
+        # Jul 18 night: this used to be gated on latch_block, i.e. the LEARNER ONLY.
+        # That handed the learner a permanent 1.5x damage multiplier on the bulk of its
+        # hits that no scripted style could ever answer - the curriculum was unwinnable
+        # by construction (wr_turtle pinned at 100%), not merely farmed. Crits are now
+        # on their own flag and every fighter gets them: the window requires having
+        # just landed a hit while grounded and unhurt, so it is the one jump that is
+        # never bunny-hopping and never contradicts a "stays grounded" style. ---
         self.ticks_since_jump += 1
-        if latch_block and self._crit_jump(obs, dist):
+        if crit_jump and self._crit_jump(obs, dist):
             action["jump"] = True
             self.ticks_since_jump = 0
         # Step-up hop for EVERYONE, scripted styles included: it's terrain

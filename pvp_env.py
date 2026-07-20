@@ -59,6 +59,7 @@ ACTIONS = [
     (False, False, False, False, False),  # 9 idle (hitselect release)
 ]
 N_ACTIONS = len(ACTIONS)
+IDLE_MOVE = 9   # index of the all-released primitive; trainer logs its uptake (idle_frac)
 
 # Composite action space the policy chooses from each tick:
 #   move  : Discrete(N_ACTIONS)     - which movement primitive (the situational read)
@@ -75,6 +76,17 @@ AIM_DIM = 2
 
 KILL_REWARD = 10.0
 DEATH_REWARD = -10.0
+# Mutual death (both fighters die in the same exchange). Previously this had NO
+# outcome of its own: whichever client's terminal frame the harness read first decided
+# it, so the same event scored +10 half the time and -10 the other half - a coin flip
+# on packet timing, which is pure variance to the critic and taught that suicidal
+# trades are fine roughly half the time. Now it is one deterministic outcome, and a
+# NEGATIVE one: dying is a loss even when you take them with you. Sized between the
+# two extremes so both orderings stay sane - trading your life for a kill (-4) must be
+# worse than disengaging alive (~0), so at low health the bot prefers to survive; but
+# it must stay better than being killed cleanly (-10), so a fighter that is dying
+# anyway is never discouraged from swinging back.
+TIE_REWARD = -4.0
 TIME_PENALTY = 0.01   # per tick, so stalling forever is never optimal
 MAX_HEALTH = 20.0
 # Firewall: hard bound on any single tick's reward. A legit tick tops out near a
@@ -113,6 +125,44 @@ FIRST_HIT_BONUS = 1.0
 # sprint reset) instead of trading 1-for-1.
 COMBO_WINDOW = 25     # ticks (1.25 s) - proper follow-up cadence is ~10-15
 COMBO_BONUS = 0.5     # per combo step, capped at 4 extra hits
+# Getting comboed (Jul 18 night): the mirror. Raw taken-damage is linear, so eating 4
+# chained hits was priced the same as 4 hits spread across a round - but the chained
+# case is far worse (airborne on knockback, sprint broken, geometry theirs). Charge an
+# escalating penalty for consecutive hits TAKEN inside COMBO_WINDOW. Landing our own
+# hit resets THEIR chain: answering back is the escape, which is exactly the hitselect
+# timing the trader style demonstrates. Because every answered hit resets the chain, an
+# even 1-for-1 trade never reaches chain 2 and pays nothing - this prices LOSING
+# exchanges and getting ragdolled, not engagement itself. Same cap as the bonus, so
+# it is bounded and safe under REWARD_CLIP (not a repeat of the aim-tax detonation).
+COMBO_TAKEN_PENALTY = 0.5   # per chain step past the first, capped at 4
+# Initiative (Jul 19): the shaping above made COUNTER-hitting the only paid opener -
+# answering back resets their chain, the scripted reflexes (blockhit, crit-jump) are
+# all post-hit, and first blood pays once a ROUND. Observed result: the bot waits to
+# get hit before every exchange instead of using hitselection as a combo STARTER
+# (trade_frac 0.55 but almost always as the answerer, mean_combo stuck ~1.8). Pay the
+# opening hit of a COLD exchange - neither side has landed for EXCHANGE_GAP ticks and
+# we didn't trade into it - so initiating is worth the same as answering. First blood
+# is excluded (already paid, and double-paying would over-weight the round opener).
+# Once per exchange by construction: landing the hit resets ticks_since_my_hit.
+OPENER_BONUS = 0.5
+EXCHANGE_GAP = 40     # ticks (2 s) of neither side landing = the exchange went cold
+# Follow-up conversion (Jul 19): the escalating combo bonus prices long chains, but
+# the hard step is the FIRST follow-up - after hit 1 the target is flung past reach,
+# the hesitation tax goes silent (ray off target), and nothing pays for re-closing,
+# so "land one, drift, wait to counter" was the cheap corner. Two terms:
+# - FOLLOWUP_BONUS: extra, once per chain, when it reaches 2 (converting the opener
+#   into a chain is worth more than the same hit later in an established chain).
+# - PRESSURE_COEF: while OUR chain is live (combo >= 1, inside COMBO_WINDOW) and the
+#   target sits beyond IDEAL_RANGE, pay per block of ground actually closed. Signed
+#   (backing off during your own window is charged), clamped to PRESSURE_STEP_MAX
+#   per tick (real sprint speed - teleports/resets can't spike it), and it can't be
+#   farmed: the window only opens by landing a real hit and lasts 1.25 s.
+FOLLOWUP_BONUS = 0.5
+PRESSURE_COEF = 0.1
+PRESSURE_STEP_MAX = 0.35   # blocks/tick; ~sprint speed, caps the term at 0.035
+# Telemetry only (no reward term): a landed hit within this many ticks of taking one is
+# counted a TRADE, so the trainer can log trade_frac - "is it trading or comboing".
+TRADE_WINDOW = 10     # ticks (0.5 s)
 # Sprint-reset (W-tap): a hit with fresh sprint launches the target much further,
 # which is what makes the follow-up land. Measured directly - the target's horizontal
 # speed on the tick AFTER our hit - so the policy is paid for real knockback, however
@@ -196,6 +246,12 @@ class PvPEnv:
         self.sim_lag = 0
         self.peer_lag = 0
         self._action_queue = deque()
+        # This round's kit, injected into every incoming state (see annotate_ping):
+        # {"my_armor", "tgt_armor", "my_atk", "tgt_atk"} in the frame_features v8
+        # units. The trainer sets it per round alongside the /replaceitem reset
+        # commands - the mod never reports gear, so Python (which assigned it) is
+        # the source of truth. Empty dict = no gear info = features read 0.
+        self.gear_info = {}
         # Chat commands run at the start of each episode (teleport/heal/regear).
         # Needs op on your own world. e.g. ["/tp SelfBot 0 64 0", "/effect SelfBot 6 1 255"]
         # May also be a CALLABLE returning the list, evaluated once per reset - that's
@@ -259,6 +315,10 @@ class PvPEnv:
         if self.peer_lag and "target_dist" in state and (state["target_dist"] or 0) > 0:
             state["tgt_ping"] = (max(state.get("tgt_ping") or 0, 0)
                                  + self.peer_lag * SIM_LAG_MS_PER_TICK)
+        # Gear is Python-assigned, not mod telemetry (see gear_info) - stamp it on
+        # the same path so features and _drain both see it.
+        if self.gear_info:
+            state.update(self.gear_info)
         return state
 
     def _send(self, action):
@@ -310,6 +370,8 @@ class PvPEnv:
         self.first_hit_done = False
         self.combo = 0
         self.ticks_since_my_hit = 999
+        self.combo_taken = 0
+        self.ticks_since_tgt_hit = 999
         self.kb_check = False
         self.last_state = state
         self.history.append(frame_features(state))
@@ -333,7 +395,8 @@ class PvPEnv:
             self.last_state, movement,
             click=bool(action["click"]), block=bool(action["block"]),
             aim_res=action["aim"],
-            latch_block=bool(action.get("latch_block", True)))
+            latch_block=bool(action.get("latch_block", True)),
+            crit_jump=bool(action.get("crit_jump", True)))
         # Jump is now a SCRIPTED crit reflex inside act_policy (not a policy head).
         # Surface whether it fired this tick so the rollout can log a crit-jump rate.
         self._scripted_jump = bool(mod_action.get("jump"))
@@ -424,10 +487,13 @@ class PvPEnv:
         # rate to tax, and taxing an involuntary knockback-airborne frame the policy
         # can't avoid only added noise. See combat.act_policy / _crit_jump.)
 
-        # First blood, once per round, signed
+        # First blood, once per round, signed. Surfaced to the trainer so the CSV can
+        # log what fraction of rounds we actually win the opening-hit race.
+        first_blood = 0
         if not self.first_hit_done and (dealt > 0.0 or taken > 0.0):
             self.first_hit_done = True
-            reward += FIRST_HIT_BONUS if dealt > taken else -FIRST_HIT_BONUS
+            first_blood = 1 if dealt > taken else -1
+            reward += FIRST_HIT_BONUS * first_blood
 
         # Sprint-reset: pay for the knockback our LAST hit actually produced (the
         # target's launch speed shows up in the frame after the health drop)
@@ -435,6 +501,16 @@ class PvPEnv:
             kb = math.hypot(state.get("tgt_vx", 0.0) or 0.0, state.get("tgt_vz", 0.0) or 0.0)
             reward += KB_COEF * min(kb / KB_NORM, 1.0)
             self.kb_check = False
+
+        # Opener (see OPENER_BONUS): this hit started a cold exchange - neither side
+        # had landed for EXCHANGE_GAP ticks (counters still hold last tick's values
+        # here), we didn't trade into it, and it isn't the round's first blood
+        # (paid above). Prices INITIATING an exchange the same as answering one.
+        opener = (dealt > 0.0 and taken == 0.0 and first_blood == 0
+                  and self.ticks_since_my_hit >= EXCHANGE_GAP
+                  and self.ticks_since_tgt_hit >= EXCHANGE_GAP)
+        if opener:
+            reward += OPENER_BONUS
 
         # Combos: escalating bonus for consecutive CLEAN hits inside the window.
         # Taking ANY damage breaks the chain, so a 1-for-1 trade no longer pays a
@@ -451,8 +527,41 @@ class PvPEnv:
                 self.combo = 1
             if self.combo >= 2:
                 reward += COMBO_BONUS * min(self.combo - 1, 4)
+                if self.combo == 2:
+                    # First follow-up landed: the opener became a chain (see
+                    # FOLLOWUP_BONUS). Once per chain by construction.
+                    reward += FOLLOWUP_BONUS
             self.ticks_since_my_hit = 0
             self.kb_check = True
+
+        # Pressure (see PRESSURE_COEF): our chain is live and the target is beyond
+        # ideal range (knocked back) - pay for ground actually closed this tick, so
+        # the moment AFTER landing a hit has a gradient toward converting instead
+        # of drifting. Signed and clamped; stacks with the potential range term.
+        if (self.combo >= 1 and self.ticks_since_my_hit <= COMBO_WINDOW
+                and prev_d is not None and new_d is not None
+                and prev_d > IDEAL_RANGE and new_d > IDEAL_RANGE):
+            reward += PRESSURE_COEF * max(-PRESSURE_STEP_MAX,
+                                          min(PRESSURE_STEP_MAX, prev_d - new_d))
+
+        # Getting comboed: the mirror of the block above (see COMBO_TAKEN_PENALTY).
+        # Landing our own hit breaks THEIR chain - answering back is the escape - so a
+        # 1-for-1 trade never escalates; only unanswered chained hits do. `traded` is
+        # computed BEFORE the resets: our hit counts as a trade if we took damage this
+        # same tick or within TRADE_WINDOW before it (telemetry only, no reward).
+        self.ticks_since_tgt_hit += 1
+        traded = dealt > 0.0 and (taken > 0.0
+                                  or self.ticks_since_tgt_hit <= TRADE_WINDOW)
+        if dealt > 0.0:
+            self.combo_taken = 0
+        if taken > 0.0:
+            if self.combo_taken > 0 and self.ticks_since_tgt_hit <= COMBO_WINDOW:
+                self.combo_taken += 1
+            else:
+                self.combo_taken = 1
+            if self.combo_taken >= 2:
+                reward -= COMBO_TAKEN_PENALTY * min(self.combo_taken - 1, 4)
+            self.ticks_since_tgt_hit = 0
 
         self.prev_my_health, self.prev_tgt_health = my_h, tgt_h
 
@@ -463,6 +572,14 @@ class PvPEnv:
         # staleness = mod-reported control-loop lag in ticks (healthy 1, spin-phase 2;
         # -1/absent until the updated jar is running).
         info = {"dealt": dealt, "taken": taken, "combo": self.combo,
+                # Exchange telemetry (Jul 18 night): combo_taken = current chain of
+                # unanswered hits taken; first_blood = +-1 on the tick the opening hit
+                # resolved (0 otherwise); trade = this tick's landed hit came within
+                # TRADE_WINDOW of taking one; blocked_hit = took a hit with block
+                # registered (the damage above was halved).
+                "combo_taken": self.combo_taken, "first_blood": first_blood,
+                "trade": traded, "opener": opener,
+                "blocked_hit": bool(taken > 0.0 and (state.get("my_block") or 0.0)),
                 "staleness": state.get("staleness", -1),
                 # Aim-quality telemetry: whiff = in-range click whose crosshair ray
                 # missed; click_eval = the denominator (in-range clicks with the new
@@ -480,7 +597,15 @@ class PvPEnv:
                 state["player_x"], state["player_y"], state["player_z"],
                 state["target_x"], state["target_y"], state["target_z"])
             info["yaw_err"] = wrap_degrees(t_yaw - state["player_yaw"])
-        if my_h <= 0.0:
+        # Mutual death seen in ONE frame (both healths at zero together). Checked before
+        # the plain death branch, which would otherwise swallow it as a clean loss.
+        # The cross-client case - each client seeing only its own side of the same
+        # mutual death a tick apart - is reconciled in SelfPlayHarness.step.
+        if my_h <= 0.0 and (tgt_h <= 0.0 or "tgt_health" not in state):
+            reward += TIE_REWARD
+            done = True
+            info["result"] = "tie"
+        elif my_h <= 0.0:
             reward += DEATH_REWARD
             done = True
             info["result"] = "death"
